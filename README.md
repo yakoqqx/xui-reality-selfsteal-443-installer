@@ -100,6 +100,7 @@ sudo bash install.sh --reconfigure
 - Hysteria2: запрос, оставить ли текущий порт; при отсутствии — запрос на добавление.
 - Хосты: адрес — домен, порты — 443 (Reality, XHTTP) и порт Hysteria2. Хосты с другим доменом не меняются.
 - Теги в правилах маршрутизации, `subURI`, правила ufw обновляются.
+- Логин и пароль панели: запрос, задать ли новые; иначе остаются прежние.
 - 2FA отключается.
 
 ## Проверки
@@ -115,7 +116,7 @@ sudo bash install.sh --reconfigure
 - в журнале Xray нет предупреждения о Reality не на 443;
 - правила ufw.
 
-Вывод: адрес панели и ссылка подписки.
+Вывод: адрес панели, логин, пароль, ссылка подписки.
 
 ## Повторный запуск
 
@@ -125,8 +126,8 @@ sudo bash install.sh --reconfigure
 
 | Путь | Назначение |
 |---|---|
-| `/root/.xui-reality-selfsteal-443-installer.conf` | ответы (0600) |
-| `/root/xui-reality-selfsteal-443-installer.log` | лог (0600), содержит сгенерированные логин и пароль |
+| `/root/.xui-reality-selfsteal-443-installer.conf` | ответы, логин и пароль панели (0600) |
+| `/root/xui-reality-selfsteal-443-installer.log` | лог (0600) |
 | `/etc/nginx/sites-available/<домен>` | сайт |
 | `/etc/nginx/conf.d/00-reject-unknown-sni.conf` | сервер по умолчанию |
 | `/var/www/<домен>/` | заглушка |

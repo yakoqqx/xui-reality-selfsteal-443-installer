@@ -11,6 +11,7 @@ LOG_FILE="${LOG_FILE:-/root/${SCRIPT_NAME}.log}"
 
 XUI_BIN="/usr/local/x-ui/x-ui"
 XUI_DB="/etc/x-ui/x-ui.db"
+XUI_INSTALL_RESULT="/etc/x-ui/install-result.env"
 XRAY_CONFIG="/usr/local/x-ui/bin/config.json"
 XUI_INSTALL_URL="https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
 ACME="/root/.acme.sh/acme.sh"
@@ -41,13 +42,13 @@ PATH_RE='^/?[A-Za-z0-9_-]+/?$'
 NAME_RE='^[A-Za-z0-9_-]+$'
 USERNAME_RE='^[A-Za-z0-9_.-]{3,32}$'
 
-CONF_KEYS=(DOMAIN CERT_FOLDER ACME_EMAIL XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME HY2 HY2_PORT CLIENT_NAME)
+CONF_KEYS=(DOMAIN CERT_FOLDER ACME_EMAIL XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH
+    XUI_CREDENTIALS_PENDING HY2 HY2_PORT CLIENT_NAME)
 declare -A CONF=()
 
 RECONFIGURE=0
 IMPORT_DB=""
-PANEL_PASSWORD=""
-SECRETS_IN_LOG=0
+IMPORTED_NOW=0
 TWO_FA_RESET=0
 DB_BACKUP=""
 NGINX_BACKUP=""
@@ -190,8 +191,6 @@ ask_password() {
         echo
         if [[ -z "$_pw_first" ]]; then
             _pw_out="$(random_string 'A-Za-z0-9' 16)"
-            log_quiet "Сгенерирован пароль панели: ${_pw_out}"
-            SECRETS_IN_LOG=1
             return 0
         fi
         if ((${#_pw_first} < 8)); then
@@ -888,6 +887,33 @@ def cmd_settings_set(db, *pairs):
     conn.close()
 
 
+
+def cmd_panel_user(db, field):
+    conn, cur = open_db(db)
+    row = cur.execute("SELECT username, password FROM users ORDER BY id LIMIT 1").fetchone()
+    conn.close()
+    print((row[0] if field == "username" else row[1]) if row else "")
+
+
+def cmd_api_token_exists(db, name):
+    conn, cur = open_db(db)
+    try:
+        row = cur.execute("SELECT 1 FROM api_tokens WHERE name=?", (name,)).fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    conn.close()
+    print("yes" if row else "no")
+
+
+def cmd_api_token_delete(db, name):
+    conn, cur = open_db(db)
+    try:
+        cur.execute("DELETE FROM api_tokens WHERE name=?", (name,))
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+    conn.close()
+
 # API ПАНЕЛИ И СОЗДАНИЕ ИНБАУНДОВ
 
 class Api:
@@ -1209,6 +1235,9 @@ COMMANDS = {
     "settings-get": cmd_settings_get,
     "settings-diff": cmd_settings_diff,
     "settings-set": cmd_settings_set,
+    "panel-user": cmd_panel_user,
+    "api-token-exists": cmd_api_token_exists,
+    "api-token-delete": cmd_api_token_delete,
     "create-missing": cmd_create_missing,
     "hosts-add": cmd_hosts_add,
     "config-summary": cmd_config_summary,
@@ -1555,23 +1584,24 @@ resolve_paths_again() {
 }
 
 resolve_credentials() {
-    local username
-    PANEL_PASSWORD=""
-    if [[ "$RECONFIGURE" -eq 0 ]]; then
+    local username password
+    [[ -n "$(conf_get XUI_CREDENTIALS_PENDING)" ]] && return 0
+    if [[ "$RECONFIGURE" -eq 1 || "$IMPORTED_NOW" -eq 1 ]]; then
+        if [[ -n "$(conf_get XUI_USERNAME)" ]] || xui_has_config; then
+            ask_yes_no "Задать новый логин и пароль панели?" n || return 0
+        fi
+    else
         [[ -n "$(conf_get XUI_USERNAME)" ]] && return 0
         xui_has_config && return 0
-    elif [[ -n "$(conf_get XUI_USERNAME)" ]] || xui_has_config; then
-        ask_yes_no "Сменить логин и пароль панели?" n || return 0
     fi
     ask_optional username "Логин панели (Enter — случайный)"
-    if [[ -z "$username" ]]; then
-        username="admin$(random_string 'a-z0-9' 6)"
-        log_quiet "Сгенерирован логин панели: ${username}"
-        SECRETS_IN_LOG=1
-    fi
+    [[ -z "$username" ]] && username="admin$(random_string 'a-z0-9' 6)"
     [[ "$username" =~ $USERNAME_RE ]] || die "Логин: 3–32 символа (буквы, цифры, точка, дефис, подчёркивание)."
-    ask_password PANEL_PASSWORD "Пароль панели"
+    ask_password password "Пароль панели"
     conf_set XUI_USERNAME "$username"
+    conf_set XUI_PASSWORD "$password"
+    conf_unset XUI_PASSWORD_HASH
+    conf_set XUI_CREDENTIALS_PENDING yes
 }
 
 # ПОРТ HYSTERIA2
@@ -1937,7 +1967,9 @@ import_db() {
     rm -f "${XUI_DB}-wal" "${XUI_DB}-shm"
     rm -rf "$work"
     [[ "$(json_get "$report" twofa_reset)" == true ]] && TWO_FA_RESET=1
-    conf_unset XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME HY2 HY2_PORT CLIENT_NAME
+    conf_unset XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH XUI_CREDENTIALS_PENDING \
+        HY2 HY2_PORT CLIENT_NAME
+    IMPORTED_NOW=1
     log "База перенесена из ${src}. Ключи Reality выпущены заново: $(json_get "$report" rekeyed)."
     [[ "$TWO_FA_RESET" -eq 1 ]] && log "2FA из базы отключена, включите её заново в панели."
     xui_start
@@ -2282,8 +2314,12 @@ check_panel() {
         log_lines "  - " <<< "$diff"
         rc=1
     fi
-    if [[ -n "$PANEL_PASSWORD" ]]; then
-        mismatch "задан новый логин и пароль панели"
+    if [[ -n "$(conf_get XUI_CREDENTIALS_PENDING)" ]]; then
+        mismatch "новые логин и пароль панели ещё не применены"
+        rc=1
+    fi
+    if [[ -e "$XUI_INSTALL_RESULT" || "$(py api-token-exists "$XUI_DB" install)" == yes ]]; then
+        mismatch "остался API-токен установщика 3x-ui"
         rc=1
     fi
     tcp_listening "$NGINX_ADDR" "$PANEL_PORT" || {
@@ -2300,8 +2336,8 @@ check_panel() {
 
 apply_panel() {
     local args=(-port "$PANEL_PORT" -listenIP "$NGINX_ADDR" -webBasePath "$(conf_get PANEL_PATH)/")
-    if [[ -n "$PANEL_PASSWORD" ]]; then
-        args+=(-username "$(conf_get XUI_USERNAME)" -password "$PANEL_PASSWORD")
+    if [[ -n "$(conf_get XUI_CREDENTIALS_PENDING)" ]]; then
+        args+=(-username "$(conf_get XUI_USERNAME)" -password "$(conf_get XUI_PASSWORD)")
     fi
     xui_stop
     backup_db_once
@@ -2310,11 +2346,15 @@ apply_panel() {
         xui_start
         return 1
     fi
-    py settings-set "$XUI_DB" "webCertFile=" "webKeyFile=" || {
+    if ! py settings-set "$XUI_DB" "webCertFile=" "webKeyFile=" || ! py api-token-delete "$XUI_DB" install; then
         xui_start
         return 1
-    }
-    PANEL_PASSWORD=""
+    fi
+    rm -f "$XUI_INSTALL_RESULT"
+    if [[ -n "$(conf_get XUI_CREDENTIALS_PENDING)" ]]; then
+        conf_set XUI_PASSWORD_HASH "$(py panel-user "$XUI_DB" password)"
+        conf_unset XUI_CREDENTIALS_PENDING
+    fi
     xui_start || return 1
     wait_for 15 tcp_listening "$NGINX_ADDR" "$PANEL_PORT"
 }
@@ -2915,12 +2955,21 @@ final_checks() {
 
 # ЗАПУСК
 
+panel_password_text() {
+    if [[ -n "$(conf_get XUI_PASSWORD)" && "$(py panel-user "$XUI_DB" password)" == "$(conf_get XUI_PASSWORD_HASH)" ]]; then
+        conf_get XUI_PASSWORD
+    else
+        printf 'задан не этим скриптом, новый: sudo bash %s --reconfigure' "${0##*/}"
+    fi
+}
+
 print_summary() {
     log ""
     log "Установка завершена."
     log "Панель:    https://$(conf_get DOMAIN)$(conf_get PANEL_PATH)/"
+    log "Логин:     $(py panel-user "$XUI_DB" username)"
+    log "Пароль:    $(panel_password_text)"
     log "Подписка:  https://$(conf_get DOMAIN)$(conf_get SUB_PATH)/$(json_get "$(xui_discover)" sub_id)"
-    [[ "$SECRETS_IN_LOG" -eq 1 ]] && log "Сгенерированные логин и пароль панели — в ${LOG_FILE}."
     [[ "$TWO_FA_RESET" -eq 1 ]] && log "2FA панели отключена при импорте, включите её заново."
     return 0
 }

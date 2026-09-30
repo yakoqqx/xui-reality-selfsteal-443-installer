@@ -102,6 +102,7 @@ Clients, panel username and password, and secret paths are taken from the databa
 - Hysteria2: asks whether to keep the current port; if absent, asks whether to add it.
 - Hosts: address is the domain, ports are 443 (Reality, XHTTP) and the Hysteria2 port. Hosts with another domain are not changed.
 - Tags in routing rules, `subURI` and ufw rules are updated.
+- Panel username and password: asks whether to set new ones; otherwise the existing ones are kept.
 - 2FA is disabled.
 
 ## Checks
@@ -117,7 +118,7 @@ After installation:
 - no warning in the Xray log about Reality not on 443;
 - ufw rules.
 
-Output: panel address and subscription link.
+Output: panel address, username, password, subscription link.
 
 ## Re-running
 
@@ -127,8 +128,8 @@ Each step compares the current state with the target state and changes only what
 
 | Path | Purpose |
 |---|---|
-| `/root/.xui-reality-selfsteal-443-installer.conf` | answers (0600) |
-| `/root/xui-reality-selfsteal-443-installer.log` | log (0600), contains the generated username and password |
+| `/root/.xui-reality-selfsteal-443-installer.conf` | answers, panel username and password (0600) |
+| `/root/xui-reality-selfsteal-443-installer.log` | log (0600) |
 | `/etc/nginx/sites-available/<domain>` | site |
 | `/etc/nginx/conf.d/00-reject-unknown-sni.conf` | default server |
 | `/var/www/<domain>/` | decoy page |
