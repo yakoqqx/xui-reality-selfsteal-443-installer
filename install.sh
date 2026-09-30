@@ -1276,8 +1276,8 @@ nginx_holds_public_443() {
     tcp_listeners "$PUBLIC_TLS_PORT" | grep '"nginx"' | awk '{print $4}' | grep -qvE '^(127\.|\[::1\])'
 }
 
-nginx_released_public_443() {
-    ! nginx_holds_public_443
+nginx_listens_only_local() {
+    [[ "$(nginx_addresses | tr '\n' ' ')" == "${REALITY_TARGET} " ]]
 }
 
 xray_holds_443() {
@@ -2168,16 +2168,12 @@ nginx_write_config() {
         journal_tail nginx
         return 1
     fi
-    wait_for 10 tcp_listening "$NGINX_ADDR" "$NGINX_PORT" || {
-        log "nginx не слушает ${REALITY_TARGET}."
-        return 1
-    }
-    if ! wait_for 10 nginx_released_public_443; then
+    if ! wait_for 15 nginx_listens_only_local; then
         systemctl restart nginx > /dev/null 2>&1
-        wait_for 10 nginx_released_public_443 || {
-            log "nginx не освободил порт ${PUBLIC_TLS_PORT}."
+        if ! wait_for 10 nginx_listens_only_local; then
+            log "nginx слушает: $(nginx_addresses | tr '\n' ' ')— нужен только ${REALITY_TARGET}. Проверьте другие конфиги в ${NGINX_SITES_ENABLED} и ${NGINX_CONF_D}."
             return 1
-        }
+        fi
     fi
 }
 
