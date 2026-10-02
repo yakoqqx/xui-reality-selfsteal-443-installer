@@ -19,8 +19,8 @@ The script deploys the 3x-ui panel on a VPS, VLESS Reality on 443/tcp disguised 
 
 - Ubuntu, root or sudo.
 - A domain or subdomain with an A record pointing to the server's IP.
-- Free ports 80/tcp (certificate issuance and renewal) and 443/tcp.
-- ufw is configured automatically. With another firewall, open: 443/tcp, SSH, the Hysteria2 UDP port, and 80/tcp while the certificate is being issued.
+- Free ports 80/tcp and 443/tcp.
+- ufw is configured automatically. With another firewall, open: 80/tcp, 443/tcp, SSH, the Hysteria2 UDP port.
 
 ## Installation
 
@@ -35,9 +35,19 @@ Answer the questions again:
 sudo bash install.sh --reconfigure
 ```
 
+Check without changing the server, exit code 0 — no errors, 1 — errors found:
+
+```bash
+sudo bash install.sh --check
+```
+
 ## Layout
 
 ```
+80/tcp         → nginx
+                   IP, foreign Host → 444
+                   domain → /.well-known/acme-challenge/  /var/www/acme
+                            other paths                   301 https://<domain>
 443/tcp        → Xray VLESS Reality (SNI = domain, target = 127.0.0.1:7443)
                    Reality client → tunnel
                    other connections → nginx 127.0.0.1:7443
@@ -50,21 +60,21 @@ sudo bash install.sh --reconfigure
 <port>/udp     → Hysteria2 (optional)
 ```
 
-Ports open from outside: 443/tcp, SSH, the Hysteria2 UDP port. All addresses in the links use the domain.
+Ports open from outside: 80/tcp, 443/tcp, SSH, the Hysteria2 UDP port. All addresses in the links use the domain.
 
 ## Components
 
 | Component | Settings |
 |---|---|
-| Certificate | Let's Encrypt, acme.sh, ECDSA, HTTP-01 on 80/tcp. Renewal: `/usr/local/sbin/cert-renew.sh` from root's cron, daily, when fewer than 30 days remain. |
-| nginx | `127.0.0.1:7443` only, TLS 1.3 + h2. Default server: `ssl_reject_handshake on`. Decoy website, XHTTP (`grpc_pass`), subscription and panel (`proxy_pass`, WebSocket) on secret paths. |
+| Certificate | Let's Encrypt, acme.sh, ECDSA, HTTP-01 through nginx (webroot `/var/www/acme`). Renewal: `/usr/local/sbin/cert-renew.sh` from root's cron, daily, when fewer than 30 days remain. |
+| nginx | `127.0.0.1:7443`, TLS 1.3 + h2. Default server: `ssl_reject_handshake on`. Decoy website, XHTTP (`grpc_pass`), subscription and panel (`proxy_pass`, WebSocket) on secret paths. 80/tcp: 301 to https for the domain, 444 for other requests. |
 | 3x-ui | Panel on `127.0.0.1:2053`, accessed through nginx. |
 | VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI is the domain, xver 0. |
 | VLESS XHTTP | `127.0.0.1:8081`, `stream-one`, security none. Host `<domain>:443`, TLS, fingerprint `firefox`. |
 | Hysteria2 | UDP, TLS with the domain certificate, ALPN `h3`, Salamander. Default port 443/udp. |
 | Routing | `geoip:ru` → blocked; UDP/443 → blocked for Reality and XHTTP. Tags from `config.json`. |
 | Subscription | `127.0.0.1:2096`, `subURI` = `https://<domain>/<subscription path>/`. |
-| ufw | SSH, 443/tcp, the Hysteria2 UDP port. |
+| ufw | SSH, 80/tcp, 443/tcp, the Hysteria2 UDP port. |
 
 Custom decoy page: on first install the script pauses; you can put `index.html` and `favicon.ico` / `.svg` / `.png` into `/var/www/<domain>/`. Otherwise a 403 page is installed.
 
@@ -109,12 +119,14 @@ Clients, panel username and password, and secret paths are taken from the databa
 
 After installation:
 
-- only Xray listens on 443/tcp, nginx only on `127.0.0.1:7443`, Hysteria2 on its UDP port;
+- only Xray listens on 443/tcp, nginx on `127.0.0.1:7443` and 80/tcp, Hysteria2 on its UDP port;
 - `config.json`: Reality on 443, target `127.0.0.1:7443`, no `limitFallback`; the UDP/443 rule covers the Reality and XHTTP tags;
 - no connections to `127.0.0.1:443`;
 - `127.0.0.1:7443`: TLS 1.3, h2, domain certificate, rejection without SNI;
 - public 443: no SNI and a foreign SNI are rejected, the domain gets the certificate;
 - the site, panel and subscription respond through 443, the subscription contains all protocols;
+- 80/tcp: by IP and with a foreign Host the connection is closed without a response, the domain gets a 301 to https, `/.well-known/acme-challenge/` is served;
+- acme.sh is in webroot mode, `cert-renew.sh` is in root's cron;
 - no warning in the Xray log about Reality not on 443;
 - ufw rules.
 
@@ -131,7 +143,10 @@ Each step compares the current state with the target state and changes only what
 | `/root/.xui-reality-selfsteal-443-installer.conf` | answers, panel username and password (0600) |
 | `/root/xui-reality-selfsteal-443-installer.log` | log (0600) |
 | `/etc/nginx/sites-available/<domain>` | site |
-| `/etc/nginx/conf.d/00-reject-unknown-sni.conf` | default server |
+| `/etc/nginx/conf.d/00-reject-unknown-sni.conf` | anti-scan 127.0.0.1:7443 |
+| `/etc/nginx/conf.d/00-http-reject.conf` | anti-scan 80/tcp |
+| `/etc/nginx/conf.d/10-http-<domain>.conf` | port 80 of the domain |
+| `/var/www/acme/` | HTTP-01 challenge directory |
 | `/var/www/<domain>/` | decoy page |
 | `/etc/ssl/<domain>/` | certificate |
 | `/usr/local/sbin/cert-renew.sh` | certificate renewal |

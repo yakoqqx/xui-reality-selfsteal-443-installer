@@ -17,8 +17,8 @@
 
 - Ubuntu, root или sudo.
 - Домен или поддомен, A-запись указывает на IP сервера.
-- Свободные порты 80/tcp (выпуск и продление сертификата) и 443/tcp.
-- ufw настраивается автоматически. При другом файрволе открыть: 443/tcp, SSH, UDP-порт Hysteria2, 80/tcp на время выпуска сертификата.
+- Свободные порты 80/tcp и 443/tcp.
+- ufw настраивается автоматически. При другом файрволе открыть: 80/tcp, 443/tcp, SSH, UDP-порт Hysteria2.
 
 ## Установка
 
@@ -33,9 +33,19 @@ sudo bash install.sh
 sudo bash install.sh --reconfigure
 ```
 
+Проверка без изменений на сервере, код выхода 0 — ошибок нет, 1 — есть ошибки:
+
+```bash
+sudo bash install.sh --check
+```
+
 ## Схема
 
 ```
+80/tcp         → nginx
+                   IP, чужой Host → 444
+                   домен → /.well-known/acme-challenge/  /var/www/acme
+                           остальные пути                301 https://<домен>
 443/tcp        → Xray VLESS Reality (SNI = домен, target = 127.0.0.1:7443)
                    клиент Reality → туннель
                    остальные подключения → nginx 127.0.0.1:7443
@@ -48,21 +58,21 @@ sudo bash install.sh --reconfigure
 <порт>/udp     → Hysteria2 (опционально)
 ```
 
-Открытые порты снаружи: 443/tcp, SSH, UDP-порт Hysteria2. Все адреса в ссылках — по домену.
+Открытые порты снаружи: 80/tcp, 443/tcp, SSH, UDP-порт Hysteria2. Все адреса в ссылках — по домену.
 
 ## Компоненты
 
 | Компонент | Настройки |
 |---|---|
-| Сертификат | Let's Encrypt, acme.sh, ECDSA, HTTP-01 на 80/tcp. Продление — `/usr/local/sbin/cert-renew.sh` из cron root, ежедневно, при сроке меньше 30 дней. |
-| nginx | Только `127.0.0.1:7443`, TLS 1.3 + h2. Сервер по умолчанию — `ssl_reject_handshake on`. Сайт-заглушка, XHTTP (`grpc_pass`), подписка и панель (`proxy_pass`, WebSocket) по секретным путям. |
+| Сертификат | Let's Encrypt, acme.sh, ECDSA, HTTP-01 через nginx (webroot `/var/www/acme`). Продление — `/usr/local/sbin/cert-renew.sh` из cron root, ежедневно, при сроке меньше 30 дней. |
+| nginx | `127.0.0.1:7443`, TLS 1.3 + h2. Сервер по умолчанию — `ssl_reject_handshake on`. Сайт-заглушка, XHTTP (`grpc_pass`), подписка и панель (`proxy_pass`, WebSocket) по секретным путям. 80/tcp: 301 на https для домена, 444 для прочих запросов. |
 | 3x-ui | Панель на `127.0.0.1:2053`, доступ через nginx. |
 | VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI — домен, xver 0. |
 | VLESS XHTTP | `127.0.0.1:8081`, `stream-one`, security none. Хост `<домен>:443`, TLS, fingerprint `firefox`. |
 | Hysteria2 | UDP, TLS с сертификатом домена, ALPN `h3`, Salamander. Порт по умолчанию 443/udp. |
 | Маршрутизация | `geoip:ru` → blocked; UDP/443 → blocked для Reality и XHTTP. Теги из `config.json`. |
 | Подписка | `127.0.0.1:2096`, `subURI` = `https://<домен>/<путь подписки>/`. |
-| ufw | SSH, 443/tcp, UDP-порт Hysteria2. |
+| ufw | SSH, 80/tcp, 443/tcp, UDP-порт Hysteria2. |
 
 Своя заглушка: при первой установке скрипт делает паузу, в `/var/www/<домен>/` можно положить `index.html` и `favicon.ico` / `.svg` / `.png`. Иначе ставится страница 403.
 
@@ -107,12 +117,14 @@ sudo bash install.sh --reconfigure
 
 После установки:
 
-- 443/tcp слушает только Xray, nginx — только `127.0.0.1:7443`, Hysteria2 — свой UDP-порт;
+- 443/tcp слушает только Xray, nginx — `127.0.0.1:7443` и 80/tcp, Hysteria2 — свой UDP-порт;
 - `config.json`: Reality на 443, target `127.0.0.1:7443`, нет `limitFallback`; правило UDP/443 — по тегам Reality и XHTTP;
 - нет соединений на `127.0.0.1:443`;
 - `127.0.0.1:7443`: TLS 1.3, h2, сертификат домена, без SNI — отказ;
 - публичный 443: без SNI и с чужим SNI — отказ, с доменом — сертификат;
 - сайт, панель и подписка отвечают через 443, в подписке есть все протоколы;
+- 80/tcp: по IP и с чужим Host — закрытие без ответа, домен — 301 на https, каталог `/.well-known/acme-challenge/` доступен;
+- acme.sh в режиме webroot, `cert-renew.sh` в cron root;
 - в журнале Xray нет предупреждения о Reality не на 443;
 - правила ufw.
 
@@ -129,7 +141,10 @@ sudo bash install.sh --reconfigure
 | `/root/.xui-reality-selfsteal-443-installer.conf` | ответы, логин и пароль панели (0600) |
 | `/root/xui-reality-selfsteal-443-installer.log` | лог (0600) |
 | `/etc/nginx/sites-available/<домен>` | сайт |
-| `/etc/nginx/conf.d/00-reject-unknown-sni.conf` | сервер по умолчанию |
+| `/etc/nginx/conf.d/00-reject-unknown-sni.conf` | антискан 127.0.0.1:7443 |
+| `/etc/nginx/conf.d/00-http-reject.conf` | антискан 80/tcp |
+| `/etc/nginx/conf.d/10-http-<домен>.conf` | порт 80 домена |
+| `/var/www/acme/` | каталог проверок HTTP-01 |
 | `/var/www/<домен>/` | заглушка |
 | `/etc/ssl/<домен>/` | сертификат |
 | `/usr/local/sbin/cert-renew.sh` | продление сертификата |

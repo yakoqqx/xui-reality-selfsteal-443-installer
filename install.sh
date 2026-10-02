@@ -20,8 +20,11 @@ NGINX_SITES_AVAILABLE="/etc/nginx/sites-available"
 NGINX_SITES_ENABLED="/etc/nginx/sites-enabled"
 NGINX_CONF_D="/etc/nginx/conf.d"
 NGINX_REJECT_CONF="${NGINX_CONF_D}/00-reject-unknown-sni.conf"
+NGINX_HTTP_REJECT_CONF="${NGINX_CONF_D}/00-http-reject.conf"
+ACME_WEBROOT="/var/www/acme"
 
 PUBLIC_TLS_PORT=443
+HTTP_PORT=80
 NGINX_ADDR="127.0.0.1"
 NGINX_PORT=7443
 REALITY_TARGET="${NGINX_ADDR}:${NGINX_PORT}"
@@ -47,6 +50,8 @@ CONF_KEYS=(DOMAIN CERT_FOLDER ACME_EMAIL XHTTP_PATH SUB_PATH PANEL_PATH XUI_USER
 declare -A CONF=()
 
 RECONFIGURE=0
+CHECK_ONLY=0
+FAIL_COUNT=0
 IMPORT_DB=""
 IMPORTED_NOW=0
 TWO_FA_RESET=0
@@ -77,7 +82,61 @@ log_lines() {
 }
 
 mismatch() {
-    log "  - $*"
+    if [[ "$CHECK_ONLY" -eq 1 ]]; then
+        report_fail "$*"
+    else
+        log "  - $*"
+    fi
+}
+
+mismatch_minor() {
+    if [[ "$CHECK_ONLY" -eq 1 ]]; then
+        report_warn "$*"
+    else
+        log "  - $*"
+    fi
+}
+
+mismatch_lines() {
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && mismatch "$line"
+    done
+}
+
+warn_lines() {
+    local line
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if [[ "$CHECK_ONLY" -eq 1 ]]; then
+            report_warn "$line"
+        else
+            log "  ! ${line}"
+        fi
+    done
+}
+
+template_differs() {
+    local what="$1" file="$2"
+    if [[ ! -e "$file" ]]; then
+        mismatch "${what} ${file} отсутствует"
+    else
+        mismatch_minor "${what} ${file} отличается от шаблона установщика"
+    fi
+}
+
+report_ok() {
+    log "  [OK]   $*"
+}
+
+report_fail() {
+    log "  [FAIL] $*"
+    FINAL_OK=0
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+}
+
+report_warn() {
+    log "  [WARN] $*"
 }
 
 die() {
@@ -113,9 +172,11 @@ version_ge() {
 
 print_usage() {
     cat << EOF
-Использование: sudo bash ${0##*/} [--reconfigure]
+Использование: sudo bash ${0##*/} [--reconfigure | --check]
 
   --reconfigure  задать вопросы заново (домен, email, пути, логин панели, Hysteria2)
+  --check        только проверка, без изменений; код выхода 0 — ошибок нет, 1 — есть ошибки,
+                 2 — проверку выполнить невозможно
 EOF
 }
 
@@ -123,6 +184,7 @@ parse_args() {
     while (($# > 0)); do
         case "$1" in
             --reconfigure) RECONFIGURE=1 ;;
+            --check) CHECK_ONLY=1 ;;
             -h | --help)
                 print_usage
                 exit 0
@@ -135,6 +197,10 @@ parse_args() {
         esac
         shift
     done
+    if [[ "$RECONFIGURE" -eq 1 && "$CHECK_ONLY" -eq 1 ]]; then
+        echo "Параметры --reconfigure и --check несовместимы." >&2
+        exit 2
+    fi
 }
 
 # ВВОД
@@ -273,10 +339,8 @@ ensure_packages() {
     fi
 }
 
-write_py_helper() {
-    PY_HELPER=$(mktemp "/tmp/${SCRIPT_NAME}-XXXXXX.py")
-    trap 'rm -f "$PY_HELPER"' EXIT
-    cat > "$PY_HELPER" << 'PYEOF'
+load_py_helper() {
+    IFS= read -r -d '' PY_HELPER << 'PYEOF' || true
 import base64
 import ipaddress
 import json
@@ -1172,9 +1236,8 @@ def cmd_routing_test(base, token, reality_tag, xhttp_tag):
 
 # ПОДПИСКА И JSON
 
-def cmd_sub_endpoints(path):
-    with open(path, "rb") as f:
-        raw = f.read().strip()
+def cmd_sub_endpoints():
+    raw = sys.stdin.buffer.read().strip()
     text = ""
     try:
         text = base64.b64decode(raw + b"=" * (-len(raw) % 4), validate=False).decode()
@@ -1268,7 +1331,7 @@ PYEOF
 }
 
 py() {
-    python3 "$PY_HELPER" "$@"
+    python3 -c "$PY_HELPER" "$@"
 }
 
 json_get() {
@@ -1305,8 +1368,36 @@ nginx_holds_public_443() {
     tcp_listeners "$PUBLIC_TLS_PORT" | grep '"nginx"' | awk '{print $4}' | grep -qvE '^(127\.|\[::1\])'
 }
 
-nginx_listens_only_local() {
-    [[ "$(nginx_addresses | tr '\n' ' ')" == "${REALITY_TARGET} " ]]
+ipv6_enabled() {
+    [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2> /dev/null)" == 0 ]]
+}
+
+nginx_http_addresses() {
+    printf '0.0.0.0:%s\n' "$HTTP_PORT"
+    if ipv6_enabled; then
+        printf '[::]:%s\n' "$HTTP_PORT"
+    fi
+}
+
+nginx_expected_addresses() {
+    printf '%s\n' "$REALITY_TARGET"
+    nginx_http_addresses
+}
+
+nginx_expected_text() {
+    nginx_expected_addresses | paste -sd ',' - | sed 's/,/, /g'
+}
+
+nginx_listens_expected() {
+    [[ "$(nginx_addresses | tr '\n' ' ')" == "$(nginx_expected_addresses | sort -u | tr '\n' ' ')" ]]
+}
+
+nginx_listens_http() {
+    local addr actual
+    actual=" $(nginx_addresses | tr '\n' ' ') "
+    while IFS= read -r addr; do
+        [[ "$actual" == *" ${addr} "* ]] || return 1
+    done < <(nginx_http_addresses)
 }
 
 xray_holds_443() {
@@ -1344,7 +1435,7 @@ tls_probe() {
     else
         args+=(-servername "$sni")
     fi
-    out=$(echo | timeout 6 openssl s_client "${args[@]}" 2>&1)
+    out=$(echo | timeout 6 openssl s_client "${args[@]}" 2>&1 | tr -d '\0')
     if grep -qa 'subject=' <<< "$out"; then
         echo cert
     else
@@ -1354,7 +1445,7 @@ tls_probe() {
 
 dest_ready() {
     local domain="$1" out
-    out=$(echo | timeout 6 openssl s_client -connect "$REALITY_TARGET" -servername "$domain" -tls1_3 -alpn h2 2>&1)
+    out=$(echo | timeout 6 openssl s_client -connect "$REALITY_TARGET" -servername "$domain" -tls1_3 -alpn h2 2>&1 | tr -d '\0')
     grep -qa 'ALPN protocol: h2' <<< "$out" || return 1
     grep -a 'subject=' <<< "$out" | grep -qF "$domain" || return 1
     [[ "$(tls_probe "$NGINX_ADDR" "$NGINX_PORT" -)" == reject ]]
@@ -1363,6 +1454,11 @@ dest_ready() {
 http_code() {
     local url="$1" resolve="$2"
     curl -sk --noproxy '*' --max-time 10 --resolve "$resolve" -o /dev/null -w '%{http_code}' "$url"
+}
+
+curl_exit_code() {
+    curl -s --noproxy '*' --max-time 10 -o /dev/null "$@" > /dev/null 2>&1
+    printf '%s' "$?"
 }
 
 # 3X-UI: СЛУЖБА, БАЗА, API
@@ -1472,8 +1568,13 @@ converge() {
 # ОТВЕТЫ ПОЛЬЗОВАТЕЛЯ
 
 discover_domain() {
-    grep -RhoE '^[[:space:]]*server_name[[:space:]]+[A-Za-z0-9.-]+\.[A-Za-z]{2,}' "$NGINX_SITES_ENABLED" 2> /dev/null \
-        | awk '{print $2}' | head -n1
+    grep -RhoE '^[[:space:]]*server_name[[:space:]]+[A-Za-z0-9.-]+\.[A-Za-z]{2,}' "$NGINX_SITES_ENABLED" "$NGINX_CONF_D" \
+        2> /dev/null | awk '{print $2}' | head -n1
+}
+
+discover_cert_folder() {
+    grep -RhoE '^[[:space:]]*ssl_certificate[[:space:]]+/etc/ssl/[A-Za-z0-9._-]+/' "$NGINX_SITES_ENABLED" 2> /dev/null \
+        | awk '{print $2}' | cut -d/ -f4 | head -n1
 }
 
 discover_email() {
@@ -1714,6 +1815,167 @@ resolve_client_name() {
     conf_set CLIENT_NAME "$name"
 }
 
+# ПОРТ 80
+
+nginx_http_site_file() {
+    printf '%s/10-http-%s.conf' "$NGINX_CONF_D" "$(conf_get DOMAIN)"
+}
+
+acme_challenge_dir() {
+    printf '%s/.well-known/acme-challenge' "$ACME_WEBROOT"
+}
+
+render_nginx_http_reject() {
+    printf 'server {\n'
+    printf '    listen %s default_server;\n' "$HTTP_PORT"
+    if ipv6_enabled; then
+        printf '    listen [::]:%s default_server;\n' "$HTTP_PORT"
+    fi
+    printf '    server_name _;\n'
+    printf '    return 444;\n'
+    printf '}\n'
+}
+
+render_nginx_http_site() {
+    local domain
+    domain=$(conf_get DOMAIN)
+    printf 'server {\n'
+    printf '    listen %s;\n' "$HTTP_PORT"
+    if ipv6_enabled; then
+        printf '    listen [::]:%s;\n' "$HTTP_PORT"
+    fi
+    cat << EOF
+    server_name ${domain};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${ACME_WEBROOT};
+        default_type text/plain;
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 301 https://${domain}\$request_uri;
+    }
+}
+EOF
+}
+
+nginx_stale_http_sites() {
+    local f current
+    current=$(nginx_http_site_file)
+    for f in "$NGINX_CONF_D"/10-http-*.conf; do
+        [[ -f "$f" && "$f" != "$current" ]] || continue
+        grep -qF "root ${ACME_WEBROOT};" "$f" && grep -qF 'return 301 https://' "$f" && printf '%s\n' "$f"
+    done
+    return 0
+}
+
+challenge_served() {
+    local addr="$1" domain dir name token body
+    domain=$(conf_get DOMAIN)
+    dir=$(acme_challenge_dir)
+    [[ -d "$dir" ]] || return 1
+    name="check-$(random_string 'a-z0-9' 16)"
+    token=$(random_string 'A-Za-z0-9' 32)
+    printf '%s' "$token" > "${dir}/${name}" 2> /dev/null || return 1
+    chmod 644 "${dir}/${name}"
+    body=$(curl -s --noproxy '*' --max-time 10 --resolve "${domain}:${HTTP_PORT}:${addr}" \
+        "http://${domain}/.well-known/acme-challenge/${name}")
+    rm -f "${dir}/${name}"
+    [[ "$body" == "$token" ]]
+}
+
+ufw_active() {
+    ufw_present && ufw status 2> /dev/null | grep -q 'Status: active'
+}
+
+check_http() {
+    local rc=0 code addr
+    if ! command -v nginx > /dev/null 2>&1; then
+        mismatch "nginx не установлен"
+        return 1
+    fi
+    render_nginx_http_reject | cmp -s - "$NGINX_HTTP_REJECT_CONF" || {
+        template_differs "антискан ${HTTP_PORT}/tcp" "$NGINX_HTTP_REJECT_CONF"
+        rc=1
+    }
+    render_nginx_http_site | cmp -s - "$(nginx_http_site_file)" || {
+        template_differs "сайт на ${HTTP_PORT}" "$(nginx_http_site_file)"
+        rc=1
+    }
+    [[ -e "${NGINX_SITES_ENABLED}/default" ]] && {
+        mismatch "подключён сайт default"
+        rc=1
+    }
+    [[ -n "$(nginx_stale_http_sites)" ]] && {
+        mismatch "лишний сайт на ${HTTP_PORT}: $(nginx_stale_http_sites | tr '\n' ' ')"
+        rc=1
+    }
+    [[ -d "$(acme_challenge_dir)" ]] || {
+        mismatch "нет каталога $(acme_challenge_dir)"
+        rc=1
+    }
+    if ! systemctl is-active --quiet nginx; then
+        mismatch "nginx не запущен"
+        return 1
+    fi
+    while IFS= read -r addr; do
+        nginx_addresses | grep -qxF "$addr" || {
+            mismatch "nginx не слушает ${addr}"
+            rc=1
+        }
+    done < <(nginx_http_addresses)
+    challenge_served 127.0.0.1 || {
+        mismatch "http://$(conf_get DOMAIN)/.well-known/acme-challenge/ не отдаёт файлы из $(acme_challenge_dir)"
+        rc=1
+    }
+    code=$(curl_exit_code "http://127.0.0.1/")
+    [[ "$code" == 52 ]] || {
+        mismatch "http://127.0.0.1/: curl exit ${code}, ожидался 52 (закрытие без ответа)"
+        rc=1
+    }
+    if ufw_active && ! ufw_allows "${HTTP_PORT}/tcp"; then
+        mismatch "нет правила ufw ${HTTP_PORT}/tcp"
+        rc=1
+    fi
+    return "$rc"
+}
+
+nginx_write_http_files() {
+    local dir f
+    dir=$(acme_challenge_dir)
+    rm -f "${NGINX_SITES_ENABLED}/default"
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && rm -f "$f" && log "  удалён ${f}"
+    done < <(nginx_stale_http_sites)
+    mkdir -p "$dir" && chmod 755 "$ACME_WEBROOT" "${ACME_WEBROOT}/.well-known" "$dir"
+    render_nginx_http_reject > "$NGINX_HTTP_REJECT_CONF"
+    render_nginx_http_site > "$(nginx_http_site_file)"
+}
+
+apply_http() {
+    local others foreign stale
+    others=$(tcp_listeners "$HTTP_PORT" | grep -v '"nginx"')
+    if [[ -n "$others" ]]; then
+        log "Порт ${HTTP_PORT}/tcp занят другим процессом:"
+        log_lines "  " <<< "$others"
+        return 1
+    fi
+    install_nginx || return 1
+    mapfile -t stale < <(nginx_stale_http_sites)
+    foreign=$(nginx_foreign_listeners "$HTTP_PORT" "$NGINX_HTTP_REJECT_CONF" "$(nginx_http_site_file)" "${stale[@]}")
+    if [[ -n "$foreign" ]]; then
+        log "Порт ${HTTP_PORT} заняли другие конфиги nginx:"
+        log_lines "  " <<< "$foreign"
+        return 1
+    fi
+    nginx_apply nginx_write_http_files nginx_listens_http || return 1
+    if ufw_present && ! ufw_allows "${HTTP_PORT}/tcp"; then
+        ufw allow "${HTTP_PORT}/tcp" comment "$SCRIPT_NAME" > /dev/null 2>&1 && log "  ufw: добавлено ${HTTP_PORT}/tcp."
+    fi
+    return 0
+}
+
 # СЕРТИФИКАТ
 
 cert_dir() {
@@ -1731,6 +1993,33 @@ cert_valid() {
     [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]]
 }
 
+acme_domain_conf() {
+    local domain
+    domain=$(conf_get DOMAIN)
+    printf '/root/.acme.sh/%s_ecc/%s.conf' "$domain" "$domain"
+}
+
+acme_webroot_set() {
+    grep -qxF "Le_Webroot='${ACME_WEBROOT}'" "$(acme_domain_conf)" 2> /dev/null
+}
+
+acme_set_webroot() {
+    local conf backup
+    conf=$(acme_domain_conf)
+    if ! grep -q '^Le_Webroot=' "$conf" 2> /dev/null; then
+        log "Нет строки Le_Webroot в ${conf}."
+        return 1
+    fi
+    backup="${conf}.bak-$(date +%F-%H%M%S)"
+    cp -p "$conf" "$backup" || return 1
+    sed -i "s|^Le_Webroot=.*|Le_Webroot='${ACME_WEBROOT}'|" "$conf"
+    if ! acme_webroot_set; then
+        log "Не удалось записать Le_Webroot='${ACME_WEBROOT}' в ${conf}."
+        return 1
+    fi
+    log "acme.sh: Le_Webroot='${ACME_WEBROOT}' в ${conf}, копия: ${backup}."
+}
+
 render_cert_renew() {
     cat << EOF
 #!/usr/bin/env bash
@@ -1741,40 +2030,15 @@ CERT="$(cert_dir)/fullchain.pem"
 DAYS_BEFORE=30
 LOG="/var/log/cert-renew.log"
 log() { echo "\$(date '+%F %T') \$*" >> "\$LOG"; }
-port80_open() { command -v ufw > /dev/null 2>&1 && ufw show added 2> /dev/null | grep -qE '^ufw allow 80/tcp( |\$)'; }
 
-if [ "\${FORCE:-0}" != "1" ]; then
-    if openssl x509 -checkend \$((DAYS_BEFORE * 86400)) -noout -in "\$CERT"; then
-        log "Cert valid >\${DAYS_BEFORE}d — no action."
-        exit 0
-    fi
+if [ "\${FORCE:-0}" != "1" ] && openssl x509 -checkend \$((DAYS_BEFORE * 86400)) -noout -in "\$CERT"; then
+    log "Cert valid >\${DAYS_BEFORE}d — no action."
+    exit 0
 fi
-log "Renewal due (or FORCE=1) — starting."
-
-close80() {
-    command -v ufw > /dev/null 2>&1 || return 0
-    for i in 1 2 3 4; do
-        port80_open || break
-        ufw --force delete allow 80/tcp > /dev/null 2>&1 || true
-    done
-    if port80_open; then
-        log "WARNING: port 80 STILL OPEN after close attempts!"
-    else
-        log "Port 80 closed."
-    fi
-}
-trap close80 EXIT
-
-if command -v ufw > /dev/null 2>&1; then
-    ufw allow 80/tcp comment 'acme http-01' > /dev/null
-    log "Port 80 opened."
-fi
-
-if "\$ACME" --renew -d "\$DOMAIN" --ecc --standalone --force; then
+log "Renewal due (or FORCE=1) — starting (webroot)."
+if "\$ACME" --renew -d "\$DOMAIN" --ecc --force; then
     log "Renewal OK."
-    if systemctl is-active --quiet nginx; then
-        systemctl reload nginx && log "nginx reloaded."
-    fi
+    systemctl reload nginx && log "nginx reloaded."
 else
     log "Renewal FAILED (acme exit \$?)."
 fi
@@ -1795,10 +2059,14 @@ check_cert() {
         mismatch "сертификата $(cert_dir)/fullchain.pem для $(conf_get DOMAIN) нет, он истекает в течение 30 дней или не совпадает с ключом"
         rc=1
     fi
-    if ! render_cert_renew | cmp -s - "$CERT_RENEW"; then
-        mismatch "${CERT_RENEW} отсутствует или устарел"
+    acme_webroot_set || {
+        mismatch "acme.sh не в режиме webroot: нет строки Le_Webroot='${ACME_WEBROOT}' в $(acme_domain_conf)"
         rc=1
-    fi
+    }
+    render_cert_renew | cmp -s - "$CERT_RENEW" || {
+        template_differs "скрипт продления" "$CERT_RENEW"
+        rc=1
+    }
     renew_cron_present || {
         mismatch "нет задачи cron для ${CERT_RENEW}"
         rc=1
@@ -1808,20 +2076,6 @@ check_cert() {
         rc=1
     }
     return "$rc"
-}
-
-ufw_open_acme_port() {
-    command -v ufw > /dev/null 2>&1 || return 0
-    ufw allow 80/tcp comment "acme ${SCRIPT_NAME}" > /dev/null 2>&1 || true
-}
-
-ufw_close_acme_port() {
-    local i
-    command -v ufw > /dev/null 2>&1 || return 0
-    for i in 1 2 3; do
-        ufw show added 2> /dev/null | grep -qE '^ufw allow 80/tcp( |$)' || return 0
-        ufw --force delete allow 80/tcp > /dev/null 2>&1 || true
-    done
 }
 
 acme_install_cert() {
@@ -1834,19 +2088,9 @@ acme_install_cert() {
 }
 
 issue_cert() {
-    local domain dir rc
+    local domain dir rc attempt
     domain=$(conf_get DOMAIN)
     dir=$(cert_dir)
-    if tcp_listeners 80 | grep -q '"nginx"' && [[ -e "${NGINX_SITES_ENABLED}/default" ]]; then
-        rm -f "${NGINX_SITES_ENABLED}/default"
-        nginx_reload
-        wait_for 5 tcp_port_free 80
-    fi
-    if ! tcp_port_free 80; then
-        log "Порт 80 занят, а он нужен для выпуска сертификата:"
-        tcp_listeners 80 | log_lines "  "
-        return 1
-    fi
     if [[ ! -x "$ACME" ]]; then
         log "Установка acme.sh."
         curl -fsSL https://get.acme.sh | sh -s email="$(conf_get ACME_EMAIL)" >> "$LOG_FILE" 2>&1
@@ -1856,21 +2100,27 @@ issue_cert() {
         }
     fi
     "$ACME" --set-default-ca --server letsencrypt >> "$LOG_FILE" 2>&1 || true
-    ufw_open_acme_port
-    log "Выпуск сертификата для ${domain} (HTTP-01 на порту 80)."
-    "$ACME" --issue -d "$domain" --standalone --keylength ec-256 >> "$LOG_FILE" 2>&1
-    rc=$?
+    for attempt in 1 2; do
+        log "Выпуск сертификата для ${domain} (HTTP-01, webroot ${ACME_WEBROOT})."
+        "$ACME" --issue -d "$domain" --keylength ec-256 -w "$ACME_WEBROOT" >> "$LOG_FILE" 2>&1
+        rc=$?
+        [[ "$rc" -eq 0 || "$rc" -eq 2 ]] && break
+        if [[ "$attempt" -eq 1 ]]; then
+            log "acme.sh завершился с кодом ${rc}, повторная попытка через 10 с."
+            sleep 10
+        fi
+    done
     if [[ "$rc" -ne 0 && "$rc" -ne 2 ]]; then
-        ufw_close_acme_port
-        log "acme.sh не выпустил сертификат (код ${rc}). Проверьте A-запись домена и доступность порта 80."
+        log "acme.sh не выпустил сертификат (код ${rc}). Проверьте A-запись домена, доступность ${HTTP_PORT}/tcp снаружи и лог ${LOG_FILE}."
         return 1
     fi
+    acme_webroot_set || acme_set_webroot || return 1
     acme_install_cert "$domain" "$dir"
-    if ! cert_valid "$domain" "$dir"; then
+    if ! cert_valid "$domain" "$dir" && [[ "$rc" -eq 2 ]]; then
+        log "Сертификат acme.sh не подходит, перевыпуск."
         "$ACME" --renew -d "$domain" --ecc --force >> "$LOG_FILE" 2>&1
         acme_install_cert "$domain" "$dir"
     fi
-    ufw_close_acme_port
     chmod 600 "${dir}/privkey.pem" 2> /dev/null
     cert_valid "$domain" "$dir" || {
         log "Сертификат не установлен в ${dir}."
@@ -1879,9 +2129,10 @@ issue_cert() {
 }
 
 apply_cert() {
-    if ! cert_valid "$(conf_get DOMAIN)" "$(cert_dir)"; then
+    if ! cert_valid "$(conf_get DOMAIN)" "$(cert_dir)" || [[ ! -f "$(acme_domain_conf)" ]]; then
         issue_cert || return 1
     fi
+    acme_webroot_set || acme_set_webroot || return 1
     render_cert_renew > "$CERT_RENEW"
     chmod 700 "$CERT_RENEW"
     [[ -x "$ACME" ]] && "$ACME" --uninstall-cronjob >> "$LOG_FILE" 2>&1
@@ -2080,18 +2331,54 @@ render_nginx_site() {
 EOF
 }
 
-nginx_foreign_public_listeners() {
-    local f real site
-    site=$(nginx_site_file)
+nginx_loaded_files() {
+    local f
+    for f in "$NGINX_SITES_ENABLED"/* "$NGINX_CONF_D"/*.conf; do
+        [[ -f "$f" ]] && printf '%s\n' "$f"
+    done
+    return 0
+}
+
+nginx_foreign_listeners() {
+    local port="$1" f real
+    shift
     while IFS= read -r f; do
         real=$(readlink -f "$f")
-        [[ "$real" == "$site" || "$real" == "$NGINX_REJECT_CONF" ]] && continue
+        [[ " $* " == *" ${real} "* ]] && continue
         [[ "$f" == "${NGINX_SITES_ENABLED}/default" ]] && continue
         if grep -E '^[[:space:]]*listen[[:space:]]' "$f" | grep -vE '127\.0\.0\.1|\[::1\]' \
-            | grep -qE "[[:space:]:]${PUBLIC_TLS_PORT}([[:space:];]|$)"; then
+            | grep -qE "[[:space:]:]${port}([[:space:];]|$)"; then
             printf '%s\n' "$f"
         fi
-    done < <(find -L "$NGINX_SITES_ENABLED" "$NGINX_CONF_D" -maxdepth 1 -type f 2> /dev/null)
+    done < <(nginx_loaded_files)
+}
+
+nginx_foreign_public_listeners() {
+    nginx_foreign_listeners "$PUBLIC_TLS_PORT" "$(nginx_site_file)" "$NGINX_REJECT_CONF"
+}
+
+nginx_stale_rejects() {
+    local f
+    while IFS= read -r f; do
+        [[ "$(readlink -f "$f")" == "$NGINX_REJECT_CONF" ]] && continue
+        grep -qE '^[[:space:]]*ssl_reject_handshake[[:space:]]+on[[:space:]]*;' "$f" || continue
+        grep -E '^[[:space:]]*listen[[:space:]]' "$f" | grep -F "${REALITY_TARGET}" | grep -q 'default_server' || continue
+        printf '%s\n' "$f"
+    done < <(nginx_loaded_files)
+}
+
+nginx_remove_stale_rejects() {
+    local f backup
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        if [[ -L "$f" ]]; then
+            rm -f "$f"
+            log "  отключён устаревший антискан ${f}"
+            continue
+        fi
+        backup="/root/$(basename "$f").bak-$(date +%F-%H%M%S)"
+        mv "$f" "$backup" && log "  устаревший антискан ${f} перенесён в ${backup}"
+    done < <(nginx_stale_rejects)
 }
 
 stub_ready() {
@@ -2168,28 +2455,28 @@ nginx_reload() {
     systemctl restart nginx > /dev/null 2>&1
 }
 
-nginx_write_config() {
-    local site link snapshot f
+nginx_managed_files() {
+    printf '%s\n' "$(nginx_site_file)" "$(nginx_site_link)" "$NGINX_REJECT_CONF" "$NGINX_HTTP_REJECT_CONF" \
+        "$(nginx_http_site_file)"
+}
+
+nginx_apply() {
+    local writer="$1" listening="$2" snapshot f
     local -A existed=()
-    site=$(nginx_site_file)
-    link=$(nginx_site_link)
     nginx_backup_once
     snapshot=$(mktemp)
     tar czf "$snapshot" -C / etc/nginx 2> /dev/null
-    for f in "$site" "$link" "$NGINX_REJECT_CONF"; do
+    while IFS= read -r f; do
         [[ -e "$f" || -L "$f" ]] && existed[$f]=1
-    done
+    done < <(nginx_managed_files)
     mkdir -p "$NGINX_SITES_AVAILABLE" "$NGINX_SITES_ENABLED" "$NGINX_CONF_D"
-    render_nginx_site > "$site"
-    render_nginx_reject > "$NGINX_REJECT_CONF"
-    ln -sfn "$site" "$link"
-    rm -f "${NGINX_SITES_ENABLED}/default"
+    "$writer"
     if ! nginx -t >> "$LOG_FILE" 2>&1; then
         log "nginx -t: ошибка конфигурации, изменения отменены:"
         nginx -t 2>&1 | tail -n 5 | log_lines "  "
-        for f in "$site" "$link" "$NGINX_REJECT_CONF"; do
+        while IFS= read -r f; do
             [[ -n "${existed[$f]:-}" ]] || rm -f "$f"
-        done
+        done < <(nginx_managed_files)
         tar xzf "$snapshot" -C / 2> /dev/null
         rm -f "$snapshot"
         return 1
@@ -2200,32 +2487,50 @@ nginx_write_config() {
         journal_tail nginx
         return 1
     fi
-    if ! wait_for 15 nginx_listens_only_local; then
+    if ! wait_for 15 "$listening"; then
         systemctl restart nginx > /dev/null 2>&1
-        if ! wait_for 10 nginx_listens_only_local; then
-            log "nginx слушает: $(nginx_addresses | tr '\n' ' ')— нужен только ${REALITY_TARGET}. Проверьте другие конфиги в ${NGINX_SITES_ENABLED} и ${NGINX_CONF_D}."
+        if ! wait_for 10 "$listening"; then
+            log "nginx слушает: $(nginx_addresses | tr '\n' ' ')— нужно: $(nginx_expected_text). Проверьте другие конфиги в ${NGINX_SITES_ENABLED} и ${NGINX_CONF_D}."
             return 1
         fi
     fi
 }
 
+nginx_write_tls_files() {
+    local site
+    site=$(nginx_site_file)
+    nginx_remove_stale_rejects
+    render_nginx_site > "$site"
+    render_nginx_reject > "$NGINX_REJECT_CONF"
+    ln -sfn "$site" "$(nginx_site_link)"
+    rm -f "${NGINX_SITES_ENABLED}/default"
+}
+
+nginx_write_config() {
+    nginx_apply nginx_write_tls_files nginx_listens_expected
+}
+
 check_nginx() {
-    local rc=0 site addr has_local=0
+    local rc=0 site addr expected has_local=0
     if ! command -v nginx > /dev/null 2>&1; then
         mismatch "nginx не установлен"
         return 1
     fi
     site=$(nginx_site_file)
     render_nginx_site | cmp -s - "$site" || {
-        mismatch "конфигурация сайта ${site} отличается от эталонной"
+        template_differs "конфигурация сайта" "$site"
         rc=1
     }
     [[ "$(readlink -f "$(nginx_site_link)")" == "$site" ]] || {
-        mismatch "сайт не подключён в ${NGINX_SITES_ENABLED}"
+        mismatch_minor "сайт ${site} не подключён в ${NGINX_SITES_ENABLED}"
         rc=1
     }
     render_nginx_reject | cmp -s - "$NGINX_REJECT_CONF" || {
-        mismatch "отбойник ${NGINX_REJECT_CONF} отсутствует или отличается от эталонного"
+        template_differs "антискан" "$NGINX_REJECT_CONF"
+        rc=1
+    }
+    [[ -n "$(nginx_stale_rejects)" ]] && {
+        mismatch "устаревший антискан на ${REALITY_TARGET}: $(nginx_stale_rejects | tr '\n' ' ')"
         rc=1
     }
     [[ -e "${NGINX_SITES_ENABLED}/default" ]] && {
@@ -2233,21 +2538,19 @@ check_nginx() {
         rc=1
     }
     stub_ready || {
-        mismatch "нет сайта-заглушки в $(www_dir)"
+        mismatch_minor "нет сайта-заглушки в $(www_dir)"
         rc=1
     }
     if ! systemctl is-active --quiet nginx; then
         mismatch "nginx не запущен"
         return 1
     fi
+    expected=" $(nginx_expected_addresses | tr '\n' ' ') "
     while IFS= read -r addr; do
-        case "$addr" in
-            "${NGINX_ADDR}:${NGINX_PORT}") has_local=1 ;;
-            *)
-                mismatch "nginx слушает лишний адрес ${addr}"
-                rc=1
-                ;;
-        esac
+        [[ "$addr" == "$REALITY_TARGET" ]] && has_local=1
+        [[ "$expected" == *" ${addr} "* ]] && continue
+        mismatch "nginx слушает лишний адрес ${addr}"
+        rc=1
     done < <(nginx_addresses)
     [[ "$has_local" -eq 1 ]] || {
         mismatch "nginx не слушает ${REALITY_TARGET}"
@@ -2271,7 +2574,6 @@ apply_nginx() {
     if [[ -n "$foreign" ]]; then
         log "Публичный порт ${PUBLIC_TLS_PORT} заняли другие конфиги nginx:"
         log_lines "  " <<< "$foreign"
-        log "Уберите из них listen ${PUBLIC_TLS_PORT} и [::]:${PUBLIC_TLS_PORT} и запустите скрипт снова."
         return 1
     fi
     nginx_write_config
@@ -2311,15 +2613,15 @@ check_panel() {
     mapfile -t wanted < <(panel_settings_wanted)
     diff=$(py settings-diff "$XUI_DB" "${wanted[@]}")
     if [[ -n "$diff" ]]; then
-        log_lines "  - " <<< "$diff"
+        mismatch_lines <<< "$diff"
         rc=1
     fi
     if [[ -n "$(conf_get XUI_CREDENTIALS_PENDING)" ]]; then
-        mismatch "новые логин и пароль панели ещё не применены"
+        mismatch_minor "новые логин и пароль панели ещё не применены"
         rc=1
     fi
     if [[ -e "$XUI_INSTALL_RESULT" || "$(py api-token-exists "$XUI_DB" install)" == yes ]]; then
-        mismatch "остался API-токен установщика 3x-ui"
+        mismatch_minor "остался API-токен установщика 3x-ui"
         rc=1
     fi
     tcp_listening "$NGINX_ADDR" "$PANEL_PORT" || {
@@ -2372,7 +2674,7 @@ check_subscription() {
     mapfile -t wanted < <(subscription_settings_wanted)
     diff=$(py settings-diff "$XUI_DB" "${wanted[@]}")
     if [[ -n "$diff" ]]; then
-        log_lines "  - " <<< "$diff"
+        mismatch_lines <<< "$diff"
         rc=1
     fi
     tcp_listening "$NGINX_ADDR" "$SUB_PORT" || {
@@ -2456,7 +2758,7 @@ check_inbounds() {
         esac
         rc=1
     done < <(json_lines "$report" missing)
-    json_lines "$report" warnings | log_lines "  ! "
+    json_lines "$report" warnings | warn_lines
     [[ "$rc" -eq 0 ]] || return 1
     runtime_inbounds_ok 0
 }
@@ -2560,11 +2862,11 @@ check_hosts() {
         mismatch "$line"
         rc=1
     done < <(json_lines "$report" problems)
-    json_lines "$report" foreign | log_lines "  ! "
+    json_lines "$report" foreign | warn_lines
     report=$(inbounds_report plan)
     if [[ -n "$(json_lines "$report" problems)" ]]; then
         mismatch "инбаунды изменились после записи Хостов"
-        json_lines "$report" problems | log_lines "    "
+        json_lines "$report" problems | mismatch_lines
         rc=1
     fi
     return "$rc"
@@ -2656,8 +2958,9 @@ ufw_target_rules() {
     while IFS= read -r port; do
         printf '%s/tcp\n' "$port"
     done < <(ssh_ports)
-    printf '%s/tcp\n' "$PUBLIC_TLS_PORT"
+    printf '%s/tcp\n' "$HTTP_PORT" "$PUBLIC_TLS_PORT"
     [[ "$(hy2_port_answer)" != 0 ]] && printf '%s/udp\n' "$(hy2_port_answer)"
+    return 0
 }
 
 ufw_simple_rules() {
@@ -2716,7 +3019,7 @@ check_ufw_cleanup() {
     ufw_present || return 0
     while IFS= read -r rule; do
         [[ -n "$rule" ]] || continue
-        mismatch "лишнее правило ufw ${rule}"
+        mismatch_minor "лишнее правило ufw ${rule}"
         rc=1
     done < <(ufw_stale_rules)
     return "$rc"
@@ -2734,19 +3037,6 @@ apply_ufw_cleanup() {
 }
 
 # ФИНАЛЬНАЯ ПРОВЕРКА
-
-report_ok() {
-    log "  [OK]   $*"
-}
-
-report_fail() {
-    log "  [FAIL] $*"
-    FINAL_OK=0
-}
-
-report_warn() {
-    log "  [WARN] $*"
-}
 
 expect_tls() {
     local host="$1" port="$2" sni="$3" want="$4" what="$5" got
@@ -2766,11 +3056,11 @@ final_listen_checks() {
     else
         report_fail "${PUBLIC_TLS_PORT}/tcp: $(tcp_listeners "$PUBLIC_TLS_PORT" | awk '{print $4, $6}' | tr '\n' ' ')"
     fi
-    addrs=$(nginx_addresses | tr '\n' ' ')
-    if [[ "$addrs" == "${REALITY_TARGET} " ]]; then
-        report_ok "nginx слушает только ${REALITY_TARGET}"
+    addrs=$(nginx_addresses | paste -sd ',' - | sed 's/,/, /g')
+    if nginx_listens_expected; then
+        report_ok "nginx слушает $(nginx_expected_text)"
     else
-        report_fail "nginx слушает: ${addrs:-ничего}"
+        report_fail "nginx слушает: ${addrs:-ничего}; нужно: $(nginx_expected_text)"
     fi
     if [[ "$hy2_port" != 0 ]]; then
         if udp_listening "$hy2_port"; then
@@ -2834,25 +3124,69 @@ final_tls_checks() {
     fi
 }
 
+expect_empty_reply() {
+    local what="$1" code
+    shift
+    code=$(curl_exit_code "$@")
+    if [[ "$code" == 52 ]]; then
+        report_ok "${what}: соединение закрыто без ответа"
+    else
+        report_fail "${what}: curl exit ${code}, ожидался 52 (закрытие без ответа)"
+    fi
+}
+
+final_http_checks() {
+    local domain="$1" ip="$2" out want
+    expect_empty_reply "http://${ip}/" "http://${ip}/"
+    expect_empty_reply "http://${ip}/, Host: scanner.invalid" -H 'Host: scanner.invalid' "http://${ip}/"
+    want="https://${domain}/check80?x=1"
+    out=$(curl -s --noproxy '*' --max-time 10 --resolve "${domain}:${HTTP_PORT}:${ip}" -o /dev/null \
+        -w '%{http_code} %{redirect_url}' "http://${domain}/check80?x=1")
+    if [[ "$out" == "301 ${want}" ]]; then
+        report_ok "http://${domain}/check80?x=1 → 301 ${want}"
+    else
+        report_fail "http://${domain}/check80?x=1 → ${out% }, ожидался 301 ${want}"
+    fi
+    if challenge_served "$ip"; then
+        report_ok "http://${domain}/.well-known/acme-challenge/ отдаёт файлы из $(acme_challenge_dir)"
+    else
+        report_fail "http://${domain}/.well-known/acme-challenge/ не отдаёт файлы из $(acme_challenge_dir)"
+    fi
+    if acme_webroot_set; then
+        report_ok "acme.sh: Le_Webroot='${ACME_WEBROOT}'"
+    else
+        report_fail "acme.sh: нет Le_Webroot='${ACME_WEBROOT}' в $(acme_domain_conf)"
+    fi
+    if [[ -s "$CERT_RENEW" ]] && ! grep -qE 'standalone|ufw' "$CERT_RENEW"; then
+        report_ok "${CERT_RENEW}: без standalone и ufw"
+    else
+        report_fail "${CERT_RENEW} отсутствует или использует standalone / ufw"
+    fi
+    if renew_cron_present && ! acme_cron_present; then
+        report_ok "cron root: ${CERT_RENEW}, без acme.sh --cron"
+    else
+        report_fail "cron root: нужна задача ${CERT_RENEW} и не нужна acme.sh --cron"
+    fi
+}
+
 final_subscription_checks() {
-    local domain="$1" ip="$2" sub_id url body meta code type endpoints hy2_port line
+    local domain="$1" ip="$2" sub_id url out body meta code type endpoints hy2_port line
     sub_id=$(json_get "$(xui_discover)" sub_id)
     if [[ -z "$sub_id" ]]; then
         report_fail "не найден клиент с subId"
         return
     fi
-    body=$(mktemp)
-    meta=$(curl -sk --noproxy '*' --max-time 10 --resolve "${domain}:${PUBLIC_TLS_PORT}:${ip}" -o "$body" \
-        -w '%{http_code}|%{content_type}' "https://${domain}$(conf_get SUB_PATH)/${sub_id}")
+    out=$(curl -sk --noproxy '*' --max-time 10 --resolve "${domain}:${PUBLIC_TLS_PORT}:${ip}" \
+        -w '\n%{http_code}|%{content_type}' "https://${domain}$(conf_get SUB_PATH)/${sub_id}")
+    body="${out%$'\n'*}"
+    meta="${out##*$'\n'}"
     code="${meta%%|*}"
     type="${meta#*|}"
-    if [[ "$code" != 200 || ! -s "$body" || "$type" == *text/html* ]]; then
+    if [[ "$code" != 200 || -z "$body" || "$type" == *text/html* ]]; then
         report_fail "подписка через ${PUBLIC_TLS_PORT}: код ${code}, тип ${type}"
-        rm -f "$body"
         return
     fi
-    endpoints=$(py sub-endpoints "$body")
-    rm -f "$body"
+    endpoints=$(py sub-endpoints <<< "$body")
     report_ok "подписка через ${PUBLIC_TLS_PORT}: 200, ссылки:"
     py json-lines "{\"items\": ${endpoints}}" items | while IFS= read -r line; do
         log "           $(json_get "$line" scheme)://…@$(json_get "$line" host):$(json_get "$line" port) $(json_get "$line" type) $(json_get "$line" security)"
@@ -2944,6 +3278,7 @@ final_checks() {
     final_config_checks
     if ip=$(get_public_ipv4); then
         final_tls_checks "$domain" "$ip"
+        final_http_checks "$domain" "$ip"
         final_subscription_checks "$domain" "$ip"
     else
         report_fail "не удалось определить публичный IPv4"
@@ -2974,20 +3309,106 @@ print_summary() {
     return 0
 }
 
+check_tools() {
+    local cmd missing=()
+    for cmd in curl openssl python3 ss; do
+        command -v "$cmd" > /dev/null 2>&1 || missing+=("$cmd")
+    done
+    ((${#missing[@]} == 0)) && return 0
+    report_fail "не найдены команды: ${missing[*]}"
+    return 1
+}
+
+check_resolve_answers() {
+    local discovered hy2_port key value
+    [[ -n "$(conf_get DOMAIN)" ]] || CONF[DOMAIN]=$(discover_domain)
+    [[ "$(conf_get DOMAIN)" =~ $DOMAIN_RE ]] || return 1
+    if [[ -z "$(conf_get CERT_FOLDER)" ]]; then
+        value=$(discover_cert_folder)
+        CONF[CERT_FOLDER]="${value:-$(conf_get DOMAIN)}"
+    fi
+    discovered=$(xui_discover)
+    for key in XHTTP_PATH:xhttp_path SUB_PATH:sub_path PANEL_PATH:web_base_path; do
+        [[ -n "$(conf_get "${key%%:*}")" ]] && continue
+        CONF[${key%%:*}]=$(normalize_path "$(json_get "$discovered" "${key#*:}")")
+    done
+    if [[ -z "$(conf_get HY2)" ]]; then
+        hy2_port=$(json_get "$discovered" hy2_port)
+        if [[ -n "$hy2_port" ]]; then
+            CONF[HY2]=yes
+            CONF[HY2_PORT]="$hy2_port"
+        else
+            CONF[HY2]=no
+        fi
+    fi
+    log "Домен: $(conf_get DOMAIN), сертификат: $(cert_dir), Hysteria2: $([[ "$(hy2_port_answer)" != 0 ]] && echo "UDP/$(hy2_port_answer)" || echo нет)"
+}
+
+check_step() {
+    local title="$1" name="$2"
+    log ""
+    log "== ${title} =="
+    if "check_${name}"; then
+        report_ok "соответствует"
+    fi
+    return 0
+}
+
+run_check() {
+    LOG_FILE=/dev/null
+    trap 'exit 2' INT TERM HUP
+    log "Проверка ${SCRIPT_NAME}, без изменений."
+    check_tools || exit 2
+    load_py_helper
+    conf_load
+    if ! check_resolve_answers; then
+        report_fail "домен не определён: нет файла ответов ${CONF_FILE} и server_name в конфигах nginx"
+        exit 2
+    fi
+    check_step "nginx: порт 80" http
+    check_step "Сертификат" cert
+    check_step "3x-ui" xui
+    if xui_has_config; then
+        check_step "nginx" nginx
+        check_step "Панель 3x-ui" panel
+        check_step "Подписка" subscription
+        check_step "Инбаунды" inbounds
+        check_step "Хосты" hosts
+        check_step "Маршрутизация" routing
+    else
+        log ""
+        report_fail "в ${XUI_DB} нет инбаундов 3x-ui: проверки nginx, панели, подписки, инбаундов, Хостов и маршрутизации пропущены"
+    fi
+    check_step "ufw" ufw
+    ufw_present && check_step "ufw: лишние правила" ufw_cleanup
+    log ""
+    log "== Финальная проверка =="
+    final_checks
+    log ""
+    if [[ "$FAIL_COUNT" -eq 0 ]]; then
+        log "Проверка завершена: ошибок нет."
+        exit 0
+    fi
+    log "Проверка завершена: ошибок: ${FAIL_COUNT}."
+    exit 1
+}
+
 main() {
     parse_args "$@"
     if [[ "$(id -u)" -ne 0 ]]; then
         echo "Запустите от root: sudo bash ${0##*/}" >&2
-        exit 1
+        exit $((CHECK_ONLY == 1 ? 2 : 1))
     fi
+    [[ "$CHECK_ONLY" -eq 1 ]] && run_check
     init_log
     trap 'die "Прервано. Повторный запуск продолжит с текущего состояния."' INT TERM HUP
     log "Запуск ${SCRIPT_NAME}. Лог: ${LOG_FILE}"
     ensure_packages
-    write_py_helper
+    load_py_helper
     conf_load
 
     resolve_base_answers
+    converge "nginx: порт 80" http
     converge "Сертификат" cert
     resolve_import
     converge "3x-ui" xui
