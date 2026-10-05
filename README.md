@@ -68,7 +68,7 @@ sudo bash install.sh --check
 | nginx | `127.0.0.1:7443`, TLS 1.3 + h2. Сервер по умолчанию — `ssl_reject_handshake on`. Сайт-заглушка, XHTTP (`grpc_pass`), подписка и панель (`proxy_pass`, WebSocket) по секретным путям. 80/tcp: 301 на https для домена, 444 для прочих запросов. |
 | 3x-ui | Панель на `127.0.0.1:2053`, доступ через nginx. |
 | VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI — домен, xver 0. |
-| VLESS XHTTP | `127.0.0.1:8081`, `stream-one`, security none. Хост `<домен>:443`, TLS, fingerprint `firefox`. |
+| VLESS XHTTP | `127.0.0.1:8081`, `stream-one`, security none. Хост `<домен>:443`, TLS, ALPN `h2`, fingerprint `firefox`. |
 | Hysteria2 | UDP, TLS с сертификатом домена, ALPN `h3`, Salamander. Порт по умолчанию 443/udp. |
 | Маршрутизация | `geoip:ru` → blocked; UDP/443 → blocked для Reality и XHTTP. Теги из `config.json`. |
 | Подписка | `127.0.0.1:2096`, `subURI` = `https://<домен>/<путь подписки>/`. |

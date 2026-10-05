@@ -363,6 +363,7 @@ REALITY_PORT = 443
 XHTTP_PORT = 8081
 XHTTP_LISTEN = "127.0.0.1"
 FINGERPRINT = "firefox"
+XHTTP_ALPN = ["h2"]
 UDP_PROTOCOLS = {"hysteria", "hysteria2", "wireguard", "amneziawg", "tuic"}
 LOCAL_LISTENS = {"127.0.0.1", "::1", "localhost"}
 AUTO_TAG = re.compile(r"^(n\d+-)?in-\d+-(tcp|udp|tcpudp|any)(-\d+)?$")
@@ -401,6 +402,16 @@ def as_dict(raw):
     except (TypeError, ValueError):
         return {}
     return value if isinstance(value, dict) else {}
+
+
+def json_list(raw):
+    if isinstance(raw, list):
+        return raw
+    try:
+        value = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    return value if isinstance(value, list) else []
 
 
 def as_int(value, default=0):
@@ -847,7 +858,7 @@ def host_rows(cur):
     present = columns(cur, "hosts")
     if not present:
         return None, present
-    wanted = ["id", "inbound_id", "address", "port", "security", "sni", "fingerprint",
+    wanted = ["id", "inbound_id", "address", "port", "security", "sni", "fingerprint", "alpn",
               "override_sni_from_address", "is_disabled"]
     select = ", ".join(f if f in present else f"NULL AS {f}" for f in wanted)
     return [dict(zip(wanted, row)) for row in cur.execute(f"SELECT {select} FROM hosts ORDER BY id")], present
@@ -858,7 +869,7 @@ def desired_host(kind, domain, hy2_port):
         return {"address": domain, "port": REALITY_PORT, "security": "same", "sni": "",
                 "override_sni_from_address": 0}
     if kind == "xhttp":
-        return {"address": domain, "port": REALITY_PORT, "security": "tls", "fingerprint": FINGERPRINT}
+        return {"address": domain, "port": REALITY_PORT, "security": "tls", "fingerprint": FINGERPRINT, "alpn": XHTTP_ALPN}
     return {"address": domain, "port": hy2_port, "security": "same"}
 
 
@@ -867,7 +878,15 @@ def same_value(key, current, wanted):
         return enabled(current) == bool(wanted) if current not in (None, "") else not wanted
     if key == "port":
         return as_int(current) == wanted
+    if key == "alpn":
+        return json_list(current) == wanted
     return (current or "") == wanted
+
+
+def host_value(key, value):
+    if key == "alpn":
+        value = ",".join(json_list(value))
+    return value if value not in (None, "") else "<пусто>"
 
 
 def cmd_hosts(mode, db, domain, hy2_port):
@@ -903,13 +922,13 @@ def cmd_hosts(mode, db, domain, hy2_port):
             diffs = {k: v for k, v in wanted.items() if k in present and not same_value(k, host.get(k), v)}
             if not diffs:
                 continue
-            text = ", ".join(f"{k} {host.get(k) if host.get(k) not in (None, '') else '<пусто>'} → {v if v != '' else '<пусто>'}"
-                             for k, v in diffs.items())
+            text = ", ".join(f"{k} {host_value(k, host.get(k))} → {host_value(k, v)}" for k, v in diffs.items())
             report["problems"].append(f"{KIND_NAMES[kind]}: Хост id={host['id']}: {text}")
             report["fixable"] += 1
             if mode == "fix":
                 assignments = ", ".join(f"{k}=?" for k in diffs)
-                cur.execute(f"UPDATE hosts SET {assignments} WHERE id=?", (*diffs.values(), host["id"]))
+                values = [json.dumps(v) if isinstance(v, list) else v for v in diffs.values()]
+                cur.execute(f"UPDATE hosts SET {assignments} WHERE id=?", (*values, host["id"]))
                 report["changes"].append(f"{KIND_NAMES[kind]}: Хост id={host['id']}: {text}")
     if mode == "fix":
         conn.commit()
@@ -1150,6 +1169,8 @@ def cmd_hosts_add(base, token, missing_json):
                 "port": item["port"], "security": item["security"]}
         if item.get("fingerprint"):
             body["fingerprint"] = item["fingerprint"]
+        if item.get("alpn"):
+            body["alpn"] = item["alpn"]
         api.call("panel/api/hosts/add", body=body)
         added.append(f"{KIND_NAMES[item['kind']]}: {item['address']}:{item['port']}")
     emit({"added": added})
