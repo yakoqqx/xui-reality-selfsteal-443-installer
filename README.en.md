@@ -68,7 +68,8 @@ Ports open from outside: 80/tcp, 443/tcp, SSH, the Hysteria2 UDP port. All addre
 |---|---|
 | Certificate | Let's Encrypt, acme.sh, ECDSA, HTTP-01 through nginx (webroot `/var/www/acme`). Renewal: `/usr/local/sbin/cert-renew.sh` from root's cron, daily, when fewer than 30 days remain. |
 | nginx | `127.0.0.1:7443`, TLS 1.3 + h2. Default server: `ssl_reject_handshake on`. Decoy website, XHTTP (`grpc_pass`), subscription and panel (`proxy_pass`, WebSocket) on secret paths. 80/tcp: 301 to https for the domain, 444 for other requests. |
-| 3x-ui | Panel on `127.0.0.1:2053`, accessed through nginx. |
+| 3x-ui | Panel on `127.0.0.1:2053`, accessed through nginx. Version: the one tested with the script; when a newer one is out, a choice is offered during installation. |
+| 3x-ui ads | Always blocked. nginx answers `/<panel path>/sponsors` with an empty list and `/<panel path>/sponsors/` with 404. The panel does not download the ad list or logos. |
 | VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI is the domain, xver 0. |
 | VLESS XHTTP | `127.0.0.1:8081`, `stream-one`, security none. Host `<domain>:443`, TLS, ALPN `h2`, fingerprint `firefox`. |
 | Hysteria2 | UDP, TLS with the domain certificate, ALPN `h3`, Salamander. Default port 443/udp. |
@@ -86,12 +87,15 @@ The script asks for:
 
 1. domain, email for Let's Encrypt;
 2. path to `x-ui.db` — leave empty;
-3. secret paths for XHTTP, the subscription, the panel;
-4. panel username and password;
-5. Hysteria2: yes/no, port;
-6. the first client's name.
+3. 3x-ui version — if a newer one than the tested version is out;
+4. secret paths for XHTTP, the subscription, the panel;
+5. panel username and password;
+6. Hysteria2: yes/no, port;
+7. the first client's name.
 
 Domain and email are required; everything else is generated if left empty.
+
+A secret path is one or more parts separated by `/`, characters `A–Z`, `a–z`, `0–9`, `-`, `_`. Paths must differ and must not contain one another.
 
 Hysteria2 port: 443 by default, `r` picks a random port in 20000–60000. Not accepted: 51820, 1194, 500, 4500, 1723; 1–1023 except 443; 7443, 8081, 2053, 2096, 62789; SSH; UDP ports in use.
 
@@ -115,6 +119,8 @@ Clients, panel username and password, and secret paths are taken from the databa
 - Panel username and password: asks whether to set new ones; otherwise the existing ones are kept.
 - 2FA is disabled.
 
+A database from a newer 3x-ui version than the installed one is not imported: the script stops before any change and lists the unknown migrations and tables.
+
 ## Checks
 
 After installation:
@@ -125,6 +131,7 @@ After installation:
 - `127.0.0.1:7443`: TLS 1.3, h2, domain certificate, rejection without SNI;
 - public 443: no SNI and a foreign SNI are rejected, the domain gets the certificate;
 - the site, panel and subscription respond through 443, the subscription contains all protocols;
+- the 3x-ui ad request is intercepted by nginx;
 - 80/tcp: by IP and with a foreign Host the connection is closed without a response, the domain gets a 301 to https, `/.well-known/acme-challenge/` is served;
 - acme.sh is in webroot mode, `cert-renew.sh` is in root's cron;
 - no warning in the Xray log about Reality not on 443;

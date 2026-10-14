@@ -13,7 +13,9 @@ XUI_BIN="/usr/local/x-ui/x-ui"
 XUI_DB="/etc/x-ui/x-ui.db"
 XUI_INSTALL_RESULT="/etc/x-ui/install-result.env"
 XRAY_CONFIG="/usr/local/x-ui/bin/config.json"
-XUI_INSTALL_URL="https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
+XUI_SUPPORTED_VERSION="v3.10.2"
+XUI_REPO="MHSanaei/3x-ui"
+SPONSORS_EMPTY='{"success":true,"msg":"","obj":{"sponsors":[]}}'
 ACME="/root/.acme.sh/acme.sh"
 CERT_RENEW="/usr/local/sbin/cert-renew.sh"
 NGINX_SITES_AVAILABLE="/etc/nginx/sites-available"
@@ -41,7 +43,7 @@ INTERNAL_PORTS=("$NGINX_PORT" "$XHTTP_PORT" "$PANEL_PORT" "$SUB_PORT" "$XRAY_API
 DOMAIN_RE='^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$'
 EMAIL_RE='^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
 FOLDER_RE='^[A-Za-z0-9._-]+$'
-PATH_RE='^/?[A-Za-z0-9_-]+/?$'
+PATH_RE='^/?[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*/?$'
 NAME_RE='^[A-Za-z0-9_-]+$'
 USERNAME_RE='^[A-Za-z0-9_.-]{3,32}$'
 
@@ -50,6 +52,7 @@ CONF_KEYS=(DOMAIN CERT_FOLDER ACME_EMAIL XHTTP_PATH SUB_PATH PANEL_PATH XUI_USER
 declare -A CONF=()
 
 RECONFIGURE=0
+XUI_VERSION=""
 CHECK_ONLY=0
 FAIL_COUNT=0
 IMPORT_DB=""
@@ -1307,6 +1310,28 @@ def cmd_json_lines(raw, key):
         print(item if isinstance(item, str) else json.dumps(item, ensure_ascii=False))
 
 
+def db_signature(path):
+    conn, cur = open_db(path)
+    tables = {row[0] for row in cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+              if not row[0].startswith("sqlite_")}
+    seeders = set()
+    if "history_of_seeders" in tables:
+        seeders = {row[0] for row in cur.execute("SELECT seeder_name FROM history_of_seeders")}
+    conn.close()
+    return tables, seeders
+
+
+def cmd_db_newer(imported, installed):
+    if not os.path.exists(installed):
+        return
+    tables, seeders = db_signature(imported)
+    known_tables, known_seeders = db_signature(installed)
+    for name in sorted(seeders - known_seeders):
+        print(f"миграция {name}")
+    for name in sorted(tables - known_tables):
+        print(f"таблица {name}")
+
+
 # ЗАПУСК
 
 COMMANDS = {
@@ -1330,6 +1355,7 @@ COMMANDS = {
     "sub-endpoints": cmd_sub_endpoints,
     "json-get": cmd_json_get,
     "json-lines": cmd_json_lines,
+    "db-newer": cmd_db_newer,
 }
 
 
@@ -1654,7 +1680,7 @@ resolve_path() {
     current=$(conf_get "$key")
     if [[ -z "$current" && -n "$discovered" ]]; then
         discovered=$(normalize_path "$discovered")
-        if [[ "$discovered" =~ ^/[A-Za-z0-9_-]+$ ]]; then
+        if [[ "$discovered" =~ ^(/[A-Za-z0-9_-]+)+$ ]]; then
             conf_set "$key" "$discovered"
             log "${prompt}: взят из базы 3x-ui."
             return 0
@@ -1670,12 +1696,24 @@ resolve_path() {
             value="${value:-$(random_string 'a-z0-9' 14)}"
         fi
         if [[ ! "$value" =~ $PATH_RE ]]; then
-            echo "  Разрешены буквы, цифры, дефис и подчёркивание."
+            echo "  Разрешены буквы, цифры, дефис, подчёркивание и / между частями пути."
             continue
         fi
         conf_set "$key" "$(normalize_path "$value")"
         return 0
     done
+}
+
+paths_conflict() {
+    local -a paths=("$(conf_get XHTTP_PATH)" "$(conf_get SUB_PATH)" "$(conf_get PANEL_PATH)")
+    local i j
+    for ((i = 0; i < ${#paths[@]}; i++)); do
+        for ((j = 0; j < ${#paths[@]}; j++)); do
+            ((i == j)) && continue
+            [[ "${paths[i]}/" == "${paths[j]}/"* ]] && return 0
+        done
+    done
+    return 1
 }
 
 resolve_paths() {
@@ -1684,9 +1722,8 @@ resolve_paths() {
     resolve_path XHTTP_PATH "Секретный путь XHTTP" "$(json_get "$discovered" xhttp_path)"
     resolve_path SUB_PATH "Секретный путь подписки" "$(json_get "$discovered" sub_path)"
     resolve_path PANEL_PATH "Секретный путь панели" "$(json_get "$discovered" web_base_path)"
-    if [[ "$(conf_get XHTTP_PATH)" == "$(conf_get SUB_PATH)" || "$(conf_get XHTTP_PATH)" == "$(conf_get PANEL_PATH)" \
-        || "$(conf_get SUB_PATH)" == "$(conf_get PANEL_PATH)" ]]; then
-        log "Пути XHTTP, подписки и панели должны различаться."
+    if paths_conflict; then
+        log "Пути XHTTP, подписки и панели должны различаться и не входить один в другой."
         for key in XHTTP_PATH SUB_PATH PANEL_PATH; do
             CONF[$key]=""
         done
@@ -1699,9 +1736,8 @@ resolve_paths_again() {
     resolve_path XHTTP_PATH "Секретный путь XHTTP" ""
     resolve_path SUB_PATH "Секретный путь подписки" ""
     resolve_path PANEL_PATH "Секретный путь панели" ""
-    if [[ "$(conf_get XHTTP_PATH)" == "$(conf_get SUB_PATH)" || "$(conf_get XHTTP_PATH)" == "$(conf_get PANEL_PATH)" \
-        || "$(conf_get SUB_PATH)" == "$(conf_get PANEL_PATH)" ]]; then
-        die "Пути XHTTP, подписки и панели совпадают."
+    if paths_conflict; then
+        die "Пути XHTTP, подписки и панели совпадают или входят один в другой."
     fi
 }
 
@@ -2171,12 +2207,16 @@ apply_cert() {
 # УСТАНОВКА 3X-UI И ПЕРЕНОС БАЗЫ
 
 check_xui() {
-    local rc=0
+    local rc=0 version
     if [[ ! -x "$XUI_BIN" ]]; then
         mismatch "3x-ui не установлен"
         return 1
     fi
-    log "  3x-ui $("$XUI_BIN" -v 2> /dev/null)"
+    version="v$("$XUI_BIN" -v 2> /dev/null)"
+    log "  3x-ui ${version}"
+    if [[ "$version" != "$XUI_SUPPORTED_VERSION" ]]; then
+        warn_lines <<< "3x-ui ${version}: со скриптом проверена ${XUI_SUPPORTED_VERSION}"
+    fi
     [[ -n "$IMPORT_DB" ]] && {
         mismatch "ожидается перенос базы ${IMPORT_DB}"
         rc=1
@@ -2192,16 +2232,51 @@ check_xui() {
     return "$rc"
 }
 
+xui_latest_version() {
+    curl -fsS --max-time 10 "https://api.github.com/repos/${XUI_REPO}/releases/latest" 2> /dev/null \
+        | python3 -c 'import json, sys; print(json.load(sys.stdin).get("tag_name", ""))' 2> /dev/null
+}
+
+resolve_xui_version() {
+    local latest choice
+    XUI_VERSION="$XUI_SUPPORTED_VERSION"
+    [[ -x "$XUI_BIN" ]] && return 0
+    latest=$(xui_latest_version)
+    if [[ ! "$latest" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
+        log_quiet "Последняя версия 3x-ui не получена из GitHub API, выбрана ${XUI_SUPPORTED_VERSION}."
+        return 0
+    fi
+    version_ge "${XUI_SUPPORTED_VERSION#v}" "${latest#v}" && return 0
+    if [[ ! -t 0 ]]; then
+        log_quiet "Последняя версия 3x-ui ${latest}, ввод не с терминала, выбрана ${XUI_SUPPORTED_VERSION}."
+        return 0
+    fi
+    echo "Версия 3x-ui:"
+    echo "  1 — ${XUI_SUPPORTED_VERSION}, проверена со скриптом"
+    echo "  2 — ${latest}, последняя, со скриптом не проверена"
+    while true; do
+        read -r -p "Выбор (Enter — 1): " choice || die "Ввод прерван."
+        case "${choice:-1}" in
+            1) return 0 ;;
+            2)
+                XUI_VERSION="$latest"
+                return 0
+                ;;
+        esac
+        echo "  Введите 1 или 2."
+    done
+}
+
 install_xui() {
-    local installer
-    log "Установка 3x-ui (1–3 минуты)."
+    local installer version="${XUI_VERSION:-$XUI_SUPPORTED_VERSION}"
+    log "Установка 3x-ui ${version} (1–3 минуты)."
     installer=$(mktemp)
-    if ! curl -fsSL "$XUI_INSTALL_URL" -o "$installer"; then
+    if ! curl -fsSL "https://raw.githubusercontent.com/${XUI_REPO}/${version}/install.sh" -o "$installer"; then
         rm -f "$installer"
-        log "Не удалось скачать установщик 3x-ui."
+        log "Не удалось скачать установщик 3x-ui ${version}."
         return 1
     fi
-    bash "$installer" < /dev/null >> "$LOG_FILE" 2>&1
+    bash "$installer" "$version" < /dev/null >> "$LOG_FILE" 2>&1
     rm -f "$installer"
     [[ -x "$XUI_BIN" ]] || {
         log "Установка 3x-ui завершилась с ошибкой."
@@ -2211,7 +2286,7 @@ install_xui() {
 }
 
 import_db() {
-    local src="$1" work report bin
+    local src="$1" work report bin newer
     bin=$(xray_bin) || {
         log "xray-core не найден."
         return 1
@@ -2223,6 +2298,14 @@ import_db() {
     }
     [[ -f "${src}-wal" ]] && cp "${src}-wal" "${work}/x-ui.db-wal"
     [[ -f "${src}-shm" ]] && cp "${src}-shm" "${work}/x-ui.db-shm"
+    newer=$(py db-newer "${work}/x-ui.db" "$XUI_DB" 2>&1)
+    if [[ -n "$newer" ]]; then
+        rm -rf "$work"
+        log "База ${src} создана более новой версией 3x-ui, чем установленная v$("$XUI_BIN" -v 2> /dev/null):"
+        log_lines "  " <<< "$newer"
+        log "Нужна 3x-ui той же версии, что на исходном сервере, или новее."
+        return 1
+    fi
     if ! report=$(py import-prepare "${work}/x-ui.db" "$bin"); then
         rm -rf "$work"
         log "Не удалось подготовить базу: ${report}"
@@ -2332,6 +2415,15 @@ render_nginx_site() {
         proxy_pass         http://127.0.0.1:${SUB_PORT};
         proxy_set_header   Host      \$host;
         proxy_set_header   X-Real-IP \$remote_addr;
+    }
+
+    location = $(conf_get PANEL_PATH)/sponsors {
+        default_type application/json;
+        return 200 '${SPONSORS_EMPTY}';
+    }
+
+    location ^~ $(conf_get PANEL_PATH)/sponsors/ {
+        return 404;
     }
 
     location $(conf_get PANEL_PATH)/ {
@@ -3122,7 +3214,7 @@ final_config_checks() {
 }
 
 final_tls_checks() {
-    local domain="$1" ip="$2" code
+    local domain="$1" ip="$2" code body
     if dest_ready "$domain"; then
         report_ok "${REALITY_TARGET}: TLS 1.3 + h2, свой сертификат, без SNI — отказ"
     else
@@ -3142,6 +3234,13 @@ final_tls_checks() {
         report_ok "панель через ${PUBLIC_TLS_PORT}: ${code}"
     else
         report_fail "панель через ${PUBLIC_TLS_PORT}: ${code}"
+    fi
+    body=$(curl -sk --noproxy '*' --max-time 10 --resolve "${domain}:${PUBLIC_TLS_PORT}:${ip}" \
+        "https://${domain}$(conf_get PANEL_PATH)/sponsors")
+    if [[ "$body" == "$SPONSORS_EMPTY" ]]; then
+        report_ok "запрос рекламы 3x-ui перехватывает nginx: пустой список"
+    else
+        report_fail "запрос рекламы 3x-ui не перехвачен nginx, ответ: ${body:0:80}"
     fi
 }
 
@@ -3432,6 +3531,7 @@ main() {
     converge "nginx: порт 80" http
     converge "Сертификат" cert
     resolve_import
+    resolve_xui_version
     converge "3x-ui" xui
     resolve_paths
     resolve_credentials
