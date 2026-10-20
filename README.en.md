@@ -11,7 +11,7 @@
 
 ---
 
-The script deploys the 3x-ui panel on a VPS, VLESS Reality on 443/tcp disguised as its own website, VLESS XHTTP, optionally Hysteria2, and outputs a single subscription link for all protocols. It issues a Let's Encrypt certificate and configures nginx, routing and ufw. Supports a fresh install and importing `x-ui.db` from another server.
+The script deploys the 3x-ui panel on a VPS, VLESS Reality on 443/tcp disguised as its own website, optionally VLESS XHTTP and Hysteria2, and outputs a single subscription link for all protocols. It issues a Let's Encrypt certificate and configures nginx, routing and ufw. Supports a fresh install and importing `x-ui.db` from another server.
 
 > The script's prompts and messages are in Russian.
 
@@ -35,7 +35,7 @@ Answer the questions again:
 sudo bash install.sh --reconfigure
 ```
 
-Check without changing the server, exit code 0 — no errors, 1 — errors found:
+Check without changing the server, exit code 0 — no errors, 1 — errors found. Paths in the answers file that differ from the 3x-ui database — WARN, the check uses the database:
 
 ```bash
 sudo bash install.sh --check
@@ -54,7 +54,7 @@ sudo bash install.sh --check
 127.0.0.1:7443 → nginx
                    foreign / empty SNI, IP → ssl_reject_handshake
                    domain → /                       decoy website
-                            /<XHTTP path>           Xray XHTTP 127.0.0.1:8081
+                            /<XHTTP path>           Xray XHTTP 127.0.0.1:8081 (optional)
                             /<subscription path>    subscription 127.0.0.1:2096
                             /<panel path>           3x-ui panel 127.0.0.1:2053
 <port>/udp     → Hysteria2 (optional)
@@ -71,11 +71,11 @@ Ports open from outside: 80/tcp, 443/tcp, SSH, the Hysteria2 UDP port. All addre
 | 3x-ui | Panel on `127.0.0.1:2053`, accessed through nginx. Version: the one tested with the script; when a newer one is out, a choice is offered during installation. |
 | 3x-ui ads | Always blocked. nginx answers `/<panel path>/sponsors` with an empty list and `/<panel path>/sponsors/` with 404. The panel does not download the ad list or logos. |
 | VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI is the domain, xver 0. |
-| VLESS XHTTP | `127.0.0.1:8081`, `stream-one`, security none. Host `<domain>:443`, TLS, ALPN `h2`, fingerprint `firefox`. |
-| Hysteria2 | UDP, TLS with the domain certificate, ALPN `h3`, Salamander. Default port 443/udp. |
+| VLESS XHTTP | Optional. `127.0.0.1:8081`, `stream-one`, security none. Host `<domain>:443`, TLS, ALPN `h2`, fingerprint `firefox`. |
+| Hysteria2 | Optional. UDP, TLS with the domain certificate, ALPN `h3`, Salamander. Default port 443/udp. |
 | Routing | `geoip:ru` → blocked; UDP/443 → blocked for Reality and XHTTP. Tags from `config.json`. |
 | Subscription | `127.0.0.1:2096`, `subURI` = `https://<domain>/<subscription path>/`. |
-| ufw | SSH, 80/tcp, 443/tcp, the Hysteria2 UDP port. |
+| ufw | SSH (ports of the sshd and ssh.socket listening sockets), 80/tcp, 443/tcp, the Hysteria2 UDP port. |
 
 Custom decoy page: on first install the script pauses; you can put `index.html` and `favicon.ico` / `.svg` / `.png` into `/var/www/<domain>/`. Otherwise a 403 page is installed.
 
@@ -88,10 +88,11 @@ The script asks for:
 1. domain, email for Let's Encrypt;
 2. path to `x-ui.db` — leave empty;
 3. 3x-ui version — if a newer one than the tested version is out;
-4. secret paths for XHTTP, the subscription, the panel;
-5. panel username and password;
-6. Hysteria2: yes/no, port;
-7. the first client's name.
+4. VLESS XHTTP: yes/no;
+5. secret paths for XHTTP, the subscription, the panel;
+6. panel username and password;
+7. Hysteria2: yes/no, port;
+8. the first client's name.
 
 Domain and email are required; everything else is generated if left empty.
 
@@ -111,10 +112,12 @@ Hysteria2 port: 443 by default, `r` picks a random port in 20000–60000. Not ac
 
 Clients, panel username and password, and secret paths are taken from the database. Changes:
 
-- Reality: port 443, target `127.0.0.1:7443`, SNI is the domain, new x25519 keys and shortIds, `limitFallback*` removed. Several enabled Reality inbounds — the script stops and lists them.
+- Reality: port 443, target `127.0.0.1:7443`, SNI is the domain, non-zero `limitFallback*` removed. x25519 keys and shortIds are kept if Reality is already in this layout, otherwise new ones. Several enabled Reality inbounds — the script stops and lists them.
 - Other inbounds on public TCP ports are disabled.
+- VLESS XHTTP: if absent from the database, asks whether to add it.
 - Hysteria2: asks whether to keep the current port; if absent, asks whether to add it.
 - Hosts: address is the domain, ports are 443 (Reality, XHTTP) and the Hysteria2 port. Hosts with another domain are not changed.
+- `externalProxy` in inbounds is removed: links are built from Hosts.
 - Tags in routing rules, `subURI` and ufw rules are updated.
 - Panel username and password: asks whether to set new ones; otherwise the existing ones are kept.
 - 2FA is disabled.
@@ -126,7 +129,7 @@ A database from a newer 3x-ui version than the installed one is not imported: th
 After installation:
 
 - only Xray listens on 443/tcp, nginx on `127.0.0.1:7443` and 80/tcp, Hysteria2 on its UDP port;
-- `config.json`: Reality on 443, target `127.0.0.1:7443`, no `limitFallback`; the UDP/443 rule covers the Reality and XHTTP tags;
+- `config.json`: Reality on 443, target `127.0.0.1:7443`, no non-zero `limitFallback`; the UDP/443 rule covers the Reality and XHTTP tags;
 - no connections to `127.0.0.1:443`;
 - `127.0.0.1:7443`: TLS 1.3, h2, domain certificate, rejection without SNI;
 - public 443: no SNI and a foreign SNI are rejected, the domain gets the certificate;

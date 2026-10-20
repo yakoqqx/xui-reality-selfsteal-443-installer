@@ -47,7 +47,7 @@ PATH_RE='^/?[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*/?$'
 NAME_RE='^[A-Za-z0-9_-]+$'
 USERNAME_RE='^[A-Za-z0-9_.-]{3,32}$'
 
-CONF_KEYS=(DOMAIN CERT_FOLDER ACME_EMAIL XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH
+CONF_KEYS=(DOMAIN CERT_FOLDER ACME_EMAIL XHTTP XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH
     XUI_CREDENTIALS_PENDING HY2 HY2_PORT CLIENT_NAME)
 declare -A CONF=()
 
@@ -177,7 +177,7 @@ print_usage() {
     cat << EOF
 Использование: sudo bash ${0##*/} [--reconfigure | --check]
 
-  --reconfigure  задать вопросы заново (домен, email, пути, логин панели, Hysteria2)
+  --reconfigure  задать вопросы заново (домен, email, XHTTP, пути, логин панели, Hysteria2)
   --check        только проверка, без изменений; код выхода 0 — ошибок нет, 1 — есть ошибки,
                  2 — проверку выполнить невозможно
 EOF
@@ -574,15 +574,20 @@ def cmd_validate_db(path):
         shutil.rmtree(work, ignore_errors=True)
 
 
-def cmd_import_prepare(db, xray_bin):
+def cmd_import_prepare(db, xray_bin, domain, target):
     conn, cur = open_db(db)
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    rekeyed = []
+    rekeyed, kept = [], []
     for ib in read_inbounds(cur):
         if not (ib["own"] and ib["kind"] == "reality"):
             continue
         rs = ib["stream"].get("realitySettings")
         if not isinstance(rs, dict):
+            continue
+        names = [str(n).lower() for n in rs.get("serverNames") or []]
+        if ((rs.get("target") or rs.get("dest")) == target and domain.lower() in names
+                and rs.get("privateKey") and rs.get("shortIds")):
+            kept.append(ib["tag"])
             continue
         private, public = x25519(xray_bin)
         rs["privateKey"] = private
@@ -599,22 +604,26 @@ def cmd_import_prepare(db, xray_bin):
     conn.commit()
     conn.execute("PRAGMA journal_mode=DELETE")
     conn.close()
-    emit({"rekeyed": rekeyed, "twofa_reset": twofa})
+    emit({"rekeyed": rekeyed, "kept": kept, "twofa_reset": twofa})
 
 
 # ПРИВЕДЕНИЕ ИНБАУНДОВ
 
-def fix_external_proxy(stream, domain, port, notes):
-    entries = stream.get("externalProxy")
-    if not isinstance(entries, list):
-        return
-    for entry in entries:
-        if not isinstance(entry, dict) or not own_address(entry.get("dest"), domain):
+def drop_external_proxy(stream, notes):
+    if stream.get("externalProxy"):
+        notes.append("externalProxy удалён: ссылки строятся из Хостов")
+        del stream["externalProxy"]
+
+
+def limit_fallback_active(rs):
+    active = []
+    for key, value in rs.items():
+        if not key.lower().startswith("limitfallback"):
             continue
-        if entry.get("dest") != domain or as_int(entry.get("port")) != port:
-            notes.append(f"externalProxy {entry.get('dest') or '<пусто>'}:{entry.get('port')} → {domain}:{port}")
-            entry["dest"] = domain
-            entry["port"] = port
+        values = value.values() if isinstance(value, dict) else [value]
+        if any(as_int(v) > 0 for v in values):
+            active.append(key)
+    return active
 
 
 def normalize_reality(ib, domain, target):
@@ -639,13 +648,13 @@ def normalize_reality(ib, domain, target):
     if as_int(rs.get("xver")) != 0:
         notes.append(f"xver {rs.get('xver')} → 0")
         rs["xver"] = 0
-    for key in [k for k in rs if k.lower().startswith("limitfallback")]:
+    for key in limit_fallback_active(rs):
         notes.append(f"{key} удалён")
         del rs[key]
     if (stream.get("network") or "").lower() == "raw":
         notes.append("network raw → tcp")
         stream["network"] = "tcp"
-    fix_external_proxy(stream, domain, REALITY_PORT, notes)
+    drop_external_proxy(stream, notes)
     if (ib["listen"] or "").strip():
         notes.append(f"listen {ib['listen']} → пусто")
         fields["listen"] = ""
@@ -670,7 +679,7 @@ def normalize_xhttp(ib, domain, path):
         stream["security"] = "none"
         stream.pop("tlsSettings", None)
         stream.pop("realitySettings", None)
-    fix_external_proxy(stream, domain, REALITY_PORT, notes)
+    drop_external_proxy(stream, notes)
     if (ib["listen"] or "").strip() != XHTTP_LISTEN:
         notes.append(f"listen {ib['listen'] or '<пусто>'} → {XHTTP_LISTEN}")
         fields["listen"] = XHTTP_LISTEN
@@ -722,7 +731,7 @@ def normalize_hy2(ib, domain, cert_folder, port):
     if isinstance(masquerade, dict) and masquerade.get("url") and masquerade["url"] != wanted_url:
         notes.append(f"masquerade {masquerade['url']} → {wanted_url}")
         masquerade["url"] = wanted_url
-    fix_external_proxy(stream, domain, port, notes)
+    drop_external_proxy(stream, notes)
     if ib["port"] != port:
         notes.append(f"порт {ib['port']} → {port}")
         fields["port"] = port
@@ -791,7 +800,7 @@ def cmd_inbounds(mode, db, domain, cert_folder, xhttp_path, hy2_port, target):
                 rs = found[0]["stream"].get("realitySettings") or {}
                 summary["target"] = rs.get("target") or rs.get("dest") or ""
             report[kind] = summary
-    wanted = ["reality", "xhttp"] + (["hy2"] if hy2_port else [])
+    wanted = ["reality"] + (["xhttp"] if xhttp_path else []) + (["hy2"] if hy2_port else [])
     report["missing"] = [kind for kind in wanted if kind not in selected]
     if report["fatal"]:
         conn.close()
@@ -809,7 +818,7 @@ def cmd_inbounds(mode, db, domain, cert_folder, xhttp_path, hy2_port, target):
             if AUTO_TAG.match(ib["tag"] or ""):
                 port_fields["tag"] = unique_tag(REALITY_PORT, "tcp", taken - {ib["tag"]})
             plans.append(("port", ib, None, port_fields, [f"порт {ib['port']} → {REALITY_PORT}"]))
-    if "xhttp" in selected:
+    if "xhttp" in selected and xhttp_path:
         ib = selected["xhttp"]
         stream, fields, notes = normalize_xhttp(ib, domain, xhttp_path)
         plans.append(("main", ib, stream, fields, notes))
@@ -1117,7 +1126,7 @@ def cmd_create_missing(base, token, db, xray_bin, domain, cert_folder, xhttp_pat
     records = client_records(cur)
     conn.close()
     selected = {kind: own_active(inbounds, kind) for kind in KINDS}
-    wanted = ["reality", "xhttp"] + (["hy2"] if p["hy2_port"] else [])
+    wanted = ["reality"] + (["xhttp"] if p["xhttp_path"] else []) + (["hy2"] if p["hy2_port"] else [])
     missing = [kind for kind in wanted if not selected[kind]]
     report = {"created": [], "new_client": None}
     if not missing:
@@ -1204,7 +1213,7 @@ def cmd_config_summary(path):
             rs = stream.get("realitySettings") or {}
             entry["target"] = str(rs.get("target") or rs.get("dest") or "")
             entry["server_names"] = rs.get("serverNames") or []
-            entry["limit_fallback"] = [k for k in rs if k.lower().startswith("limitfallback")]
+            entry["limit_fallback"] = limit_fallback_active(rs)
         result[kind] = entry
     rules = (config.get("routing") or {}).get("rules") or []
     udp_rules = [r for r in rules if is_udp443_block(r)]
@@ -1225,7 +1234,7 @@ def cmd_routing_apply(base, token, reality_tag, xhttp_tag):
     if not any(is_ru_block(r) for r in rules):
         rules.append({"type": "field", "ip": ["geoip:ru"], "outboundTag": "blocked"})
         changes.append("добавлено geoip:ru → blocked")
-    tags = sorted({reality_tag, xhttp_tag})
+    tags = sorted({tag for tag in (reality_tag, xhttp_tag) if tag})
     old = [r for r in rules if is_udp443_block(r)]
     if len(old) != 1 or sorted(set(old[0].get("inboundTag") or [])) != tags:
         rules[:] = [r for r in rules if not is_udp443_block(r)]
@@ -1247,11 +1256,12 @@ def cmd_routing_test(base, token, reality_tag, xhttp_tag):
     probe = "probe-" + "".join(c for c in reality_tag + xhttp_tag if c.isalnum())
     checks = {
         "Reality UDP/443 блокируется": blocked(reality_tag, "8.8.8.8", "udp"),
-        "XHTTP UDP/443 блокируется": blocked(xhttp_tag, "8.8.8.8", "udp"),
         "другой инбаунд UDP/443 не блокируется": not blocked(probe, "8.8.8.8", "udp"),
         "TCP/443 не блокируется": not blocked(reality_tag, "8.8.8.8", "tcp"),
         "geoip:ru блокируется": blocked(reality_tag, "77.88.8.8", "tcp"),
     }
+    if xhttp_tag:
+        checks["XHTTP UDP/443 блокируется"] = blocked(xhttp_tag, "8.8.8.8", "udp")
     failed = [name for name, ok in checks.items() if not ok]
     emit({"failed": failed})
     if failed:
@@ -1458,9 +1468,14 @@ nginx_addresses() {
 ssh_ports() {
     local ports
     ports=$({
-        sshd -T 2> /dev/null | awk '$1 == "port" {print $2}'
         ss -Htlnp 2> /dev/null | awk '/"sshd"/ {n = split($4, a, ":"); print a[n]}'
+        if systemctl is-active --quiet ssh.socket 2> /dev/null; then
+            systemctl show -p Listen --value ssh.socket 2> /dev/null | grep -oE ':[0-9]+ \(Stream\)' | grep -oE '[0-9]+'
+        fi
     } | grep -E '^[0-9]+$' | sort -un)
+    if [[ -z "$ports" ]]; then
+        ports=$(sshd -T 2> /dev/null | awk '$1 == "port" {print $2}' | grep -E '^[0-9]+$' | sort -un)
+    fi
     printf '%s\n' "${ports:-22}"
 }
 
@@ -1588,6 +1603,15 @@ api_base() {
     printf 'http://%s:%s%s/' "$NGINX_ADDR" "$PANEL_PORT" "$(conf_get PANEL_PATH)"
 }
 
+xhttp_enabled() {
+    [[ "$(conf_get XHTTP)" != no ]]
+}
+
+xhttp_path_answer() {
+    xhttp_enabled || return 0
+    conf_get XHTTP_PATH
+}
+
 hy2_port_answer() {
     if [[ "$(conf_get HY2)" == yes ]]; then
         conf_get HY2_PORT
@@ -1710,21 +1734,38 @@ paths_conflict() {
     for ((i = 0; i < ${#paths[@]}; i++)); do
         for ((j = 0; j < ${#paths[@]}; j++)); do
             ((i == j)) && continue
+            [[ -n "${paths[i]}" && -n "${paths[j]}" ]] || continue
             [[ "${paths[i]}/" == "${paths[j]}/"* ]] && return 0
         done
     done
     return 1
 }
 
+resolve_xhttp() {
+    local current
+    current=$(json_get "$(xui_discover)" xhttp_path)
+    if [[ -n "$current" ]]; then
+        [[ "$(conf_get XHTTP)" == yes ]] || conf_set XHTTP yes
+        return 0
+    fi
+    [[ -n "$(conf_get XHTTP)" && "$RECONFIGURE" -eq 0 ]] && return 0
+    if ask_yes_no "Добавить VLESS XHTTP?" y; then
+        conf_set XHTTP yes
+    else
+        conf_set XHTTP no
+        conf_unset XHTTP_PATH
+    fi
+}
+
 resolve_paths() {
     local discovered="{}" key
     xui_has_config && discovered=$(xui_discover)
-    resolve_path XHTTP_PATH "Секретный путь XHTTP" "$(json_get "$discovered" xhttp_path)"
+    xhttp_enabled && resolve_path XHTTP_PATH "Секретный путь XHTTP" "$(json_get "$discovered" xhttp_path)"
     resolve_path SUB_PATH "Секретный путь подписки" "$(json_get "$discovered" sub_path)"
     resolve_path PANEL_PATH "Секретный путь панели" "$(json_get "$discovered" web_base_path)"
     if paths_conflict; then
         log "Пути XHTTP, подписки и панели должны различаться и не входить один в другой."
-        for key in XHTTP_PATH SUB_PATH PANEL_PATH; do
+        for key in $(xhttp_enabled && echo XHTTP_PATH) SUB_PATH PANEL_PATH; do
             CONF[$key]=""
         done
         conf_save
@@ -1733,7 +1774,7 @@ resolve_paths() {
 }
 
 resolve_paths_again() {
-    resolve_path XHTTP_PATH "Секретный путь XHTTP" ""
+    xhttp_enabled && resolve_path XHTTP_PATH "Секретный путь XHTTP" ""
     resolve_path SUB_PATH "Секретный путь подписки" ""
     resolve_path PANEL_PATH "Секретный путь панели" ""
     if paths_conflict; then
@@ -2306,7 +2347,7 @@ import_db() {
         log "Нужна 3x-ui той же версии, что на исходном сервере, или новее."
         return 1
     fi
-    if ! report=$(py import-prepare "${work}/x-ui.db" "$bin"); then
+    if ! report=$(py import-prepare "${work}/x-ui.db" "$bin" "$(conf_get DOMAIN)" "$REALITY_TARGET"); then
         rm -rf "$work"
         log "Не удалось подготовить базу: ${report}"
         return 1
@@ -2322,10 +2363,12 @@ import_db() {
     rm -f "${XUI_DB}-wal" "${XUI_DB}-shm"
     rm -rf "$work"
     [[ "$(json_get "$report" twofa_reset)" == true ]] && TWO_FA_RESET=1
-    conf_unset XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH XUI_CREDENTIALS_PENDING \
+    conf_unset XHTTP XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH XUI_CREDENTIALS_PENDING \
         HY2 HY2_PORT CLIENT_NAME
     IMPORTED_NOW=1
-    log "База перенесена из ${src}. Ключи Reality выпущены заново: $(json_get "$report" rekeyed)."
+    log "База перенесена из ${src}."
+    [[ "$(json_get "$report" kept)" != "[]" ]] && log "Ключи Reality сохранены: $(json_get "$report" kept)."
+    [[ "$(json_get "$report" rekeyed)" != "[]" ]] && log "Ключи Reality выпущены заново: $(json_get "$report" rekeyed)."
     [[ "$TWO_FA_RESET" -eq 1 ]] && log "2FA из базы отключена, включите её заново в панели."
     xui_start
 }
@@ -2379,6 +2422,23 @@ render_nginx_reject() {
     printf '}\n'
 }
 
+render_nginx_xhttp_location() {
+    cat << EOF
+    location $(conf_get XHTTP_PATH) {
+        grpc_pass            grpc://127.0.0.1:${XHTTP_PORT};
+        grpc_set_header      Host              \$host;
+        grpc_set_header      X-Real-IP         \$remote_addr;
+        grpc_set_header      X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        grpc_set_header      X-Forwarded-Proto \$scheme;
+        client_max_body_size 0;
+        client_body_timeout  1h;
+        grpc_read_timeout    1h;
+        grpc_send_timeout    1h;
+    }
+
+EOF
+}
+
 render_nginx_site() {
     local domain folder
     domain=$(conf_get DOMAIN)
@@ -2399,18 +2459,11 @@ render_nginx_site() {
     root  /var/www/${folder};
     index index.html;
 
-    location $(conf_get XHTTP_PATH) {
-        grpc_pass            grpc://127.0.0.1:${XHTTP_PORT};
-        grpc_set_header      Host              \$host;
-        grpc_set_header      X-Real-IP         \$remote_addr;
-        grpc_set_header      X-Forwarded-For   \$proxy_add_x_forwarded_for;
-        grpc_set_header      X-Forwarded-Proto \$scheme;
-        client_max_body_size 0;
-        client_body_timeout  1h;
-        grpc_read_timeout    1h;
-        grpc_send_timeout    1h;
-    }
-
+EOF
+    if xhttp_enabled; then
+        render_nginx_xhttp_location
+    fi
+    cat << EOF
     location $(conf_get SUB_PATH) {
         proxy_pass         http://127.0.0.1:${SUB_PORT};
         proxy_set_header   Host      \$host;
@@ -2813,7 +2866,7 @@ apply_subscription() {
 # ИНБАУНДЫ
 
 inbounds_report() {
-    py inbounds "$1" "$XUI_DB" "$(conf_get DOMAIN)" "$(conf_get CERT_FOLDER)" "$(conf_get XHTTP_PATH)" \
+    py inbounds "$1" "$XUI_DB" "$(conf_get DOMAIN)" "$(conf_get CERT_FOLDER)" "$(xhttp_path_answer)" \
         "$(hy2_port_answer)" "$REALITY_TARGET"
 }
 
@@ -2830,17 +2883,17 @@ runtime_inbounds_ok() {
         rc=1
     fi
     if [[ "$(json_get "$summary" reality.limit_fallback)" != "[]" ]]; then
-        [[ "$quiet" -eq 1 ]] || mismatch "config.json: в Reality есть limitFallback"
+        [[ "$quiet" -eq 1 ]] || mismatch "config.json: в Reality ненулевые limitFallback"
         rc=1
     fi
     xray_holds_443 || {
         [[ "$quiet" -eq 1 ]] || mismatch "Xray не слушает ${PUBLIC_TLS_PORT}/tcp"
         rc=1
     }
-    tcp_listening "$NGINX_ADDR" "$XHTTP_PORT" || {
+    if xhttp_enabled && ! tcp_listening "$NGINX_ADDR" "$XHTTP_PORT"; then
         [[ "$quiet" -eq 1 ]] || mismatch "XHTTP не слушает ${NGINX_ADDR}:${XHTTP_PORT}"
         rc=1
-    }
+    fi
     if [[ "$hy2_port" != 0 ]]; then
         if [[ "$(json_get "$summary" hy2.port)" != "$hy2_port" ]] || ! udp_listening "$hy2_port"; then
             [[ "$quiet" -eq 1 ]] || mismatch "Hysteria2 не слушает UDP/${hy2_port}"
@@ -2924,7 +2977,7 @@ create_missing_inbounds() {
     systemctl is-active --quiet x-ui || xui_start || return 1
     token=$(api_token) || return 1
     if ! report=$(py create-missing "$(api_base)" "$token" "$XUI_DB" "$(xray_bin)" "$(conf_get DOMAIN)" \
-        "$(conf_get CERT_FOLDER)" "$(conf_get XHTTP_PATH)" "$(hy2_port_answer)" "$REALITY_TARGET" \
+        "$(conf_get CERT_FOLDER)" "$(xhttp_path_answer)" "$(hy2_port_answer)" "$REALITY_TARGET" \
         "$(conf_get CLIENT_NAME)"); then
         log "Не удалось создать инбаунды: ${report}"
         return 1
@@ -3025,8 +3078,8 @@ check_routing() {
         return 1
     fi
     summary=$(py config-summary "$XRAY_CONFIG") || return 1
-    if [[ -z "$(json_get "$summary" reality.tag)" || -z "$(json_get "$summary" xhttp.tag)" ]]; then
-        mismatch "в config.json нет Reality или XHTTP"
+    if [[ -z "$(json_get "$summary" reality.tag)" ]] || { xhttp_enabled && [[ -z "$(json_get "$summary" xhttp.tag)" ]]; }; then
+        mismatch "в config.json нет Reality$(xhttp_enabled && echo " или XHTTP")"
         return 1
     fi
     [[ "$(json_get "$summary" ru_block)" == true ]] || {
@@ -3196,7 +3249,7 @@ final_config_checks() {
         report_fail "config.json: Reality порт $(json_get "$summary" reality.port), target $(json_get "$summary" reality.target)"
     fi
     if [[ "$(json_get "$summary" reality.limit_fallback)" == "[]" ]]; then
-        report_ok "config.json: limitFallback нет"
+        report_ok "config.json: ненулевых limitFallback нет"
     else
         report_fail "config.json: limitFallback $(json_get "$summary" reality.limit_fallback)"
     fi
@@ -3313,7 +3366,7 @@ final_subscription_checks() {
     done
     hy2_port=$(hy2_port_answer)
     py_expect_endpoint "$endpoints" vless "$domain" "$PUBLIC_TLS_PORT" reality "VLESS Reality"
-    py_expect_endpoint "$endpoints" vless "$domain" "$PUBLIC_TLS_PORT" xhttp "VLESS XHTTP"
+    xhttp_enabled && py_expect_endpoint "$endpoints" vless "$domain" "$PUBLIC_TLS_PORT" xhttp "VLESS XHTTP"
     [[ "$hy2_port" != 0 ]] && py_expect_endpoint "$endpoints" hysteria2 "$domain" "$hy2_port" "" "Hysteria2"
     url="https://${domain}$(conf_get SUB_PATH)/verify-fake-subid-00000000"
     code=$(http_code "$url" "${domain}:${PUBLIC_TLS_PORT}:${ip}")
@@ -3440,7 +3493,7 @@ check_tools() {
 }
 
 check_resolve_answers() {
-    local discovered hy2_port key value
+    local discovered hy2_port key value name field label
     [[ -n "$(conf_get DOMAIN)" ]] || CONF[DOMAIN]=$(discover_domain)
     [[ "$(conf_get DOMAIN)" =~ $DOMAIN_RE ]] || return 1
     if [[ -z "$(conf_get CERT_FOLDER)" ]]; then
@@ -3448,10 +3501,17 @@ check_resolve_answers() {
         CONF[CERT_FOLDER]="${value:-$(conf_get DOMAIN)}"
     fi
     discovered=$(xui_discover)
-    for key in XHTTP_PATH:xhttp_path SUB_PATH:sub_path PANEL_PATH:web_base_path; do
-        [[ -n "$(conf_get "${key%%:*}")" ]] && continue
-        CONF[${key%%:*}]=$(normalize_path "$(json_get "$discovered" "${key#*:}")")
+    for key in "XHTTP_PATH:xhttp_path:путь XHTTP" "SUB_PATH:sub_path:путь подписки" "PANEL_PATH:web_base_path:путь панели"; do
+        IFS=: read -r name field label <<< "$key"
+        value=$(normalize_path "$(json_get "$discovered" "$field")")
+        if [[ -n "$value" && -n "$(conf_get "$name")" && "$value" != "$(normalize_path "$(conf_get "$name")")" ]]; then
+            report_warn "файл ответов ${CONF_FILE}: ${label} $(normalize_path "$(conf_get "$name")"), в базе 3x-ui ${value}; проверка по базе, запуск без --check применит значение из файла ответов"
+        fi
+        [[ -n "$value" || -z "$(conf_get "$name")" ]] && CONF[$name]="$value"
     done
+    if [[ -z "$(conf_get XHTTP)" ]]; then
+        CONF[XHTTP]=$([[ -n "$(conf_get XHTTP_PATH)" ]] && echo yes || echo no)
+    fi
     if [[ -z "$(conf_get HY2)" ]]; then
         hy2_port=$(json_get "$discovered" hy2_port)
         if [[ -n "$hy2_port" ]]; then
@@ -3461,7 +3521,7 @@ check_resolve_answers() {
             CONF[HY2]=no
         fi
     fi
-    log "Домен: $(conf_get DOMAIN), сертификат: $(cert_dir), Hysteria2: $([[ "$(hy2_port_answer)" != 0 ]] && echo "UDP/$(hy2_port_answer)" || echo нет)"
+    log "Домен: $(conf_get DOMAIN), сертификат: $(cert_dir), XHTTP: $(xhttp_enabled && echo да || echo нет), Hysteria2: $([[ "$(hy2_port_answer)" != 0 ]] && echo "UDP/$(hy2_port_answer)" || echo нет)"
 }
 
 check_step() {
@@ -3533,6 +3593,7 @@ main() {
     resolve_import
     resolve_xui_version
     converge "3x-ui" xui
+    resolve_xhttp
     resolve_paths
     resolve_credentials
     converge "nginx" nginx
