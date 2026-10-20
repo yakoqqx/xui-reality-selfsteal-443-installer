@@ -77,6 +77,8 @@ Ports open from outside: 80/tcp, 443/tcp, SSH, the Hysteria2 UDP port. All addre
 | Subscription | `127.0.0.1:2096`, `subURI` = `https://<domain>/<subscription path>/`. |
 | ufw | SSH (ports of the sshd and ssh.socket listening sockets), 80/tcp, 443/tcp, the Hysteria2 UDP port. |
 
+Custom directives for the panel location (e.g. `sub_filter`): `/etc/nginx/snippets/xui-panel*.conf`, included via `include`, the script never changes these files.
+
 Custom decoy page: on first install the script pauses; you can put `index.html` and `favicon.ico` / `.svg` / `.png` into `/var/www/<domain>/`. Otherwise a 403 page is installed.
 
 ## Installation modes

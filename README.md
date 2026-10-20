@@ -75,6 +75,8 @@ sudo bash install.sh --check
 | Подписка | `127.0.0.1:2096`, `subURI` = `https://<домен>/<путь подписки>/`. |
 | ufw | SSH (порты слушающих сокетов sshd и ssh.socket), 80/tcp, 443/tcp, UDP-порт Hysteria2. |
 
+Свои директивы для location панели (например `sub_filter`): `/etc/nginx/snippets/xui-panel*.conf`, подключаются через `include`, скрипт эти файлы не меняет.
+
 Своя заглушка: при первой установке скрипт делает паузу, в `/var/www/<домен>/` можно положить `index.html` и `favicon.ico` / `.svg` / `.png`. Иначе ставится страница 403.
 
 ## Режимы установки

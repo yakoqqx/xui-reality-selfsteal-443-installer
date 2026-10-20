@@ -23,6 +23,7 @@ NGINX_SITES_ENABLED="/etc/nginx/sites-enabled"
 NGINX_CONF_D="/etc/nginx/conf.d"
 NGINX_REJECT_CONF="${NGINX_CONF_D}/00-reject-unknown-sni.conf"
 NGINX_HTTP_REJECT_CONF="${NGINX_CONF_D}/00-http-reject.conf"
+NGINX_PANEL_SNIPPETS="/etc/nginx/snippets/xui-panel*.conf"
 ACME_WEBROOT="/var/www/acme"
 
 PUBLIC_TLS_PORT=443
@@ -57,6 +58,7 @@ CHECK_ONLY=0
 FAIL_COUNT=0
 IMPORT_DB=""
 IMPORTED_NOW=0
+XUI_INSTALLED_NOW=0
 TWO_FA_RESET=0
 DB_BACKUP=""
 NGINX_BACKUP=""
@@ -2382,6 +2384,7 @@ import_db() {
 apply_xui() {
     if [[ ! -x "$XUI_BIN" ]]; then
         install_xui || return 1
+        XUI_INSTALLED_NOW=1
     fi
     if [[ -n "$IMPORT_DB" ]]; then
         import_db "$IMPORT_DB" || return 1
@@ -2494,6 +2497,7 @@ EOF
         proxy_http_version 1.1;
         proxy_set_header   Upgrade           \$http_upgrade;
         proxy_set_header   Connection        "upgrade";
+        include            ${NGINX_PANEL_SNIPPETS};
     }
 
     location / {
@@ -2792,7 +2796,11 @@ check_panel() {
         mismatch_minor "новые логин и пароль панели ещё не применены"
         rc=1
     fi
-    if [[ -e "$XUI_INSTALL_RESULT" || "$(py api-token-exists "$XUI_DB" install)" == yes ]]; then
+    if [[ -e "$XUI_INSTALL_RESULT" ]]; then
+        mismatch_minor "остался ${XUI_INSTALL_RESULT}"
+        rc=1
+    fi
+    if fresh_xui_token && [[ "$(py api-token-exists "$XUI_DB" install)" == yes ]]; then
         mismatch_minor "остался API-токен установщика 3x-ui"
         rc=1
     fi
@@ -2808,6 +2816,10 @@ check_panel() {
     return "$rc"
 }
 
+fresh_xui_token() {
+    [[ "$XUI_INSTALLED_NOW" -eq 1 && "$IMPORTED_NOW" -eq 0 ]]
+}
+
 apply_panel() {
     local args=(-port "$PANEL_PORT" -listenIP "$NGINX_ADDR" -webBasePath "$(conf_get PANEL_PATH)/")
     if [[ -n "$(conf_get XUI_CREDENTIALS_PENDING)" ]]; then
@@ -2820,7 +2832,11 @@ apply_panel() {
         xui_start
         return 1
     fi
-    if ! py settings-set "$XUI_DB" "webCertFile=" "webKeyFile=" || ! py api-token-delete "$XUI_DB" install; then
+    if ! py settings-set "$XUI_DB" "webCertFile=" "webKeyFile="; then
+        xui_start
+        return 1
+    fi
+    if fresh_xui_token && ! py api-token-delete "$XUI_DB" install; then
         xui_start
         return 1
     fi
