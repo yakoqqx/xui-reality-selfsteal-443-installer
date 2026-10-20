@@ -377,6 +377,9 @@ INBOUND_FIELDS = ["id", "protocol", "port", "tag", "enable", "listen", "settings
                   "stream_settings", "remark", "node_id", "origin_node_guid"]
 CLIENT_KEYS = ("email", "enable", "subId", "limitIp", "totalGB", "expiryTime", "tgId",
                "comment", "reset", "group")
+RU_GEOIP = re.compile(r"^(geoip:ru|ext:[^:]+:ru)$", re.I)
+RULE_MATCH_KEYS = ("domain", "port", "sourcePort", "localPort", "network", "source", "sourceIP", "localIP",
+                   "user", "inboundTag", "protocol", "attrs", "vlessRoute", "process")
 
 
 # ОБЩИЕ ФУНКЦИИ
@@ -1191,7 +1194,10 @@ def cmd_hosts_add(base, token, missing_json):
 # МАРШРУТИЗАЦИЯ И CONFIG.JSON
 
 def is_ru_block(rule):
-    return rule.get("outboundTag") == "blocked" and rule.get("ip") == ["geoip:ru"]
+    ips = rule.get("ip")
+    return (rule.get("outboundTag") == "blocked" and rule.get("enabled", True) is not False
+            and isinstance(ips, list) and any(RU_GEOIP.match(str(ip)) for ip in ips)
+            and not any(rule.get(key) for key in RULE_MATCH_KEYS))
 
 
 def is_udp443_block(rule):

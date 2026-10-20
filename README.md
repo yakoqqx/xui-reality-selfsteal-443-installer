@@ -71,7 +71,7 @@ sudo bash install.sh --check
 | VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI — домен, xver 0. |
 | VLESS XHTTP | Опционально. `127.0.0.1:8081`, `stream-one`, security none. Хост `<домен>:443`, TLS, ALPN `h2`, fingerprint `firefox`. |
 | Hysteria2 | Опционально. UDP, TLS с сертификатом домена, ALPN `h3`, Salamander. Порт по умолчанию 443/udp. |
-| Маршрутизация | `geoip:ru` → blocked; UDP/443 → blocked для Reality и XHTTP. Теги из `config.json`. |
+| Маршрутизация | `geoip:ru` → blocked, если нет правила blocked с `geoip:ru` или `ext:<файл>:ru`; UDP/443 → blocked для Reality и XHTTP. Теги из `config.json`. |
 | Подписка | `127.0.0.1:2096`, `subURI` = `https://<домен>/<путь подписки>/`. |
 | ufw | SSH (порты слушающих сокетов sshd и ssh.socket), 80/tcp, 443/tcp, UDP-порт Hysteria2. |
 

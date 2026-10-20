@@ -73,7 +73,7 @@ Ports open from outside: 80/tcp, 443/tcp, SSH, the Hysteria2 UDP port. All addre
 | VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI is the domain, xver 0. |
 | VLESS XHTTP | Optional. `127.0.0.1:8081`, `stream-one`, security none. Host `<domain>:443`, TLS, ALPN `h2`, fingerprint `firefox`. |
 | Hysteria2 | Optional. UDP, TLS with the domain certificate, ALPN `h3`, Salamander. Default port 443/udp. |
-| Routing | `geoip:ru` → blocked; UDP/443 → blocked for Reality and XHTTP. Tags from `config.json`. |
+| Routing | `geoip:ru` → blocked unless a blocked rule with `geoip:ru` or `ext:<file>:ru` exists; UDP/443 → blocked for Reality and XHTTP. Tags from `config.json`. |
 | Subscription | `127.0.0.1:2096`, `subURI` = `https://<domain>/<subscription path>/`. |
 | ufw | SSH (ports of the sshd and ssh.socket listening sockets), 80/tcp, 443/tcp, the Hysteria2 UDP port. |
 
