@@ -35,11 +35,29 @@ Answer the questions again:
 sudo bash install.sh --reconfigure
 ```
 
-Check without changing the server, exit code 0 — no errors, 1 — errors found. Paths in the answers file that differ from the 3x-ui database — WARN, the check uses the database:
+Check without changing the server, exit code 0 — no errors, 1 — errors found. Paths in the answers file that differ from the 3x-ui database — warning, the check uses the database:
 
 ```bash
 sudo bash install.sh --check
 ```
+
+Removing components of choice:
+
+```bash
+sudo bash install.sh --uninstall
+```
+
+| Item | Removed |
+|---|---|
+| 1 | 3x-ui: x-ui service, `/usr/local/x-ui`, `/etc/x-ui`, `/var/log/x-ui`, fail2ban jail `3x-ipl`. Database copy — `/root/x-ui.db.<date>`. |
+| 2 | nginx configs created by the script: site, anti-scan, port 80. |
+| 3 | Certificate `/etc/ssl/<folder>`, the domain in acme.sh, `cert-renew.sh`, cron job. acme.sh is removed entirely if it holds no other domains. |
+| 4 | ufw rules with the script comment, except SSH. |
+| 5 | Items 1–4, decoy site, answers file, log, `/root/nginx-*.tgz` archives. |
+
+nginx and fail2ban packages — a separate question. curl, openssl, python3, sqlite3, cron are not removed. `/etc/nginx/snippets/xui-panel*.conf` files are not removed.
+
+Reinstalling 3x-ui: `--uninstall`, item 1, then `sudo bash install.sh`.
 
 ## Layout
 

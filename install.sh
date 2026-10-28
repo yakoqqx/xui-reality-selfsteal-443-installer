@@ -13,7 +13,7 @@ XUI_BIN="/usr/local/x-ui/x-ui"
 XUI_DB="/etc/x-ui/x-ui.db"
 XUI_INSTALL_RESULT="/etc/x-ui/install-result.env"
 XRAY_CONFIG="/usr/local/x-ui/bin/config.json"
-XUI_SUPPORTED_VERSION="v3.10.2"
+XUI_SUPPORTED_VERSION="v3.11.0"
 XUI_REPO="MHSanaei/3x-ui"
 SPONSORS_EMPTY='{"success":true,"msg":"","obj":{"sponsors":[]}}'
 ACME="/root/.acme.sh/acme.sh"
@@ -53,6 +53,7 @@ CONF_KEYS=(DOMAIN CERT_FOLDER ACME_EMAIL XHTTP XHTTP_PATH SUB_PATH PANEL_PATH XU
 declare -A CONF=()
 
 RECONFIGURE=0
+UNINSTALL=0
 XUI_VERSION=""
 CHECK_ONLY=0
 FAIL_COUNT=0
@@ -65,14 +66,26 @@ NGINX_BACKUP=""
 PY_HELPER=""
 FINAL_OK=1
 STALE_PORTS=""
+INDENT="        "
+STEP_NO=0
+STEP_TOTAL=0
+IN_STEP=0
+LAST_BLANK=1
 
 # ОБЩИЕ ФУНКЦИИ
 
+emit() {
+    printf '%s\n' "$1"
+    printf '[%s] %s\n' "$(date '+%F %T')" "$1" >> "$LOG_FILE"
+    [[ -z "$1" ]] && LAST_BLANK=1 || LAST_BLANK=0
+}
+
 log() {
-    local line
-    line="[$(date '+%F %T')] $*"
-    printf '%s\n' "$line"
-    printf '%s\n' "$line" >> "$LOG_FILE"
+    if [[ "$IN_STEP" -eq 1 && -n "$*" ]]; then
+        emit "${INDENT}$*"
+    else
+        emit "$*"
+    fi
 }
 
 log_quiet() {
@@ -86,11 +99,23 @@ log_lines() {
     done
 }
 
+step() {
+    STEP_NO=$((STEP_NO + 1))
+    [[ "$LAST_BLANK" -eq 1 ]] || emit ""
+    emit "$(printf '%-8s%s' "[${STEP_NO}/${STEP_TOTAL}]" "$1")"
+    IN_STEP=1
+}
+
+step_end() {
+    IN_STEP=0
+    emit ""
+}
+
 mismatch() {
     if [[ "$CHECK_ONLY" -eq 1 ]]; then
         report_fail "$*"
     else
-        log "  - $*"
+        log "$*"
     fi
 }
 
@@ -98,7 +123,7 @@ mismatch_minor() {
     if [[ "$CHECK_ONLY" -eq 1 ]]; then
         report_warn "$*"
     else
-        log "  - $*"
+        log "$*"
     fi
 }
 
@@ -112,12 +137,7 @@ mismatch_lines() {
 warn_lines() {
     local line
     while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        if [[ "$CHECK_ONLY" -eq 1 ]]; then
-            report_warn "$line"
-        else
-            log "  ! ${line}"
-        fi
+        [[ -n "$line" ]] && report_warn "$line"
     done
 }
 
@@ -126,28 +146,38 @@ template_differs() {
     if [[ ! -e "$file" ]]; then
         mismatch "${what} ${file} отсутствует"
     else
-        mismatch_minor "${what} ${file} отличается от шаблона установщика"
+        mismatch_minor "${what} ${file} отличается от шаблона"
     fi
 }
 
 report_ok() {
-    log "  [OK]   $*"
+    log "✓ $*"
 }
 
 report_fail() {
-    log "  [FAIL] $*"
+    log "✗ $*"
     FINAL_OK=0
     FAIL_COUNT=$((FAIL_COUNT + 1))
 }
 
 report_warn() {
-    log "  [WARN] $*"
+    log "! $*"
 }
 
 die() {
-    log "$*"
-    log "Остановлено. Подробности: ${LOG_FILE}. После исправления запустите скрипт снова."
+    if [[ "$IN_STEP" -eq 1 ]]; then
+        log "✗ $*"
+    else
+        log "$*"
+    fi
+    IN_STEP=0
+    emit ""
+    emit "Остановлено. Журнал: ${LOG_FILE}"
     exit 1
+}
+
+prompted() {
+    LAST_BLANK=0
 }
 
 init_log() {
@@ -177,11 +207,12 @@ version_ge() {
 
 print_usage() {
     cat << EOF
-Использование: sudo bash ${0##*/} [--reconfigure | --check]
+Использование: sudo bash ${0##*/} [--reconfigure | --check | --uninstall]
 
   --reconfigure  задать вопросы заново (домен, email, XHTTP, пути, логин панели, Hysteria2)
   --check        только проверка, без изменений; код выхода 0 — ошибок нет, 1 — есть ошибки,
                  2 — проверку выполнить невозможно
+  --uninstall    удаление компонентов на выбор: 3x-ui, nginx, сертификат, правила ufw, всё
 EOF
 }
 
@@ -190,6 +221,7 @@ parse_args() {
         case "$1" in
             --reconfigure) RECONFIGURE=1 ;;
             --check) CHECK_ONLY=1 ;;
+            --uninstall) UNINSTALL=1 ;;
             -h | --help)
                 print_usage
                 exit 0
@@ -202,8 +234,8 @@ parse_args() {
         esac
         shift
     done
-    if [[ "$RECONFIGURE" -eq 1 && "$CHECK_ONLY" -eq 1 ]]; then
-        echo "Параметры --reconfigure и --check несовместимы." >&2
+    if ((RECONFIGURE + CHECK_ONLY + UNINSTALL > 1)); then
+        echo "Параметры --reconfigure, --check и --uninstall несовместимы." >&2
         exit 2
     fi
 }
@@ -215,8 +247,10 @@ ask() {
     local _ask_prompt="$2" _ask_def="$3" _ask_regex="${4:-}" _ask_err="${5:-Неверный формат.}" _ask_value
     while true; do
         if [[ -n "$_ask_def" ]]; then
+            prompted
             read -r -p "${_ask_prompt} (Enter — ${_ask_def}): " _ask_value || die "Ввод прерван."
         else
+            prompted
             read -r -p "${_ask_prompt}: " _ask_value || die "Ввод прерван."
         fi
         _ask_value="${_ask_value:-$_ask_def}"
@@ -236,6 +270,7 @@ ask() {
 ask_optional() {
     local -n _opt_out="$1"
     local _opt_value
+    prompted
     read -r -p "$2: " _opt_value || die "Ввод прерван."
     _opt_out="$_opt_value"
 }
@@ -244,13 +279,14 @@ ask_yes_no() {
     local prompt="$1" def="$2" hint="[Y/n]" value
     [[ "$def" == "n" ]] && hint="[y/N]"
     while true; do
+        prompted
         read -r -p "${prompt} ${hint}: " value || die "Ввод прерван."
         value="${value:-$def}"
         case "${value,,}" in
             y | yes | д | да) return 0 ;;
             n | no | н | нет) return 1 ;;
         esac
-        echo "  Ответьте y или n."
+        echo "  Ожидается y или n."
     done
 }
 
@@ -258,6 +294,7 @@ ask_password() {
     local -n _pw_out="$1"
     local _pw_first _pw_second
     while true; do
+        prompted
         read -rs -p "$2 (Enter — случайный): " _pw_first || die "Ввод прерван."
         echo
         if [[ -z "$_pw_first" ]]; then
@@ -796,7 +833,7 @@ def cmd_inbounds(mode, db, domain, cert_folder, xhttp_path, hy2_port, target):
     for kind in KINDS:
         found = own_active(inbounds, kind)
         if len(found) > 1:
-            report["fatal"].append(f"{KIND_NAMES[kind]}: включено несколько инбаундов, оставьте один: "
+            report["fatal"].append(f"{KIND_NAMES[kind]}: включено несколько инбаундов, допускается один: "
                                    + "; ".join(describe(ib) for ib in found))
         elif found:
             selected[kind] = found[0]
@@ -1576,7 +1613,7 @@ xui_stop() {
 xui_start() {
     systemctl reset-failed x-ui > /dev/null 2>&1 || true
     if ! systemctl start x-ui > /dev/null 2>&1 || ! wait_for 30 xui_ready; then
-        log "x-ui не запустился. Журнал x-ui записан в лог."
+        log "x-ui не запустился, журнал x-ui записан в ${LOG_FILE}"
         journal_tail x-ui
         return 1
     fi
@@ -1591,7 +1628,7 @@ xui_restart() {
 backup_db_once() {
     [[ -n "$DB_BACKUP" || ! -s "$XUI_DB" ]] && return 0
     DB_BACKUP="${XUI_DB}.bak-$(date +%F-%H%M%S)"
-    cp "$XUI_DB" "$DB_BACKUP" || die "Не удалось сделать резервную копию базы ${XUI_DB}."
+    cp "$XUI_DB" "$DB_BACKUP" || die "Не удалось сделать резервную копию базы ${XUI_DB}"
     log "Резервная копия базы: ${DB_BACKUP}"
 }
 
@@ -1600,7 +1637,7 @@ api_token() {
     out=$("$XUI_BIN" setting -getApiToken -tokenName "$SCRIPT_NAME" 2>&1)
     token=$(printf '%s\n' "$out" | grep -Eo 'apiToken: *[^ ]+' | awk '{print $2}')
     if [[ -z "$token" ]]; then
-        log "Не удалось получить API-токен панели."
+        log "API-токен панели не получен"
         log_quiet "$out"
         return 1
     fi
@@ -1632,16 +1669,17 @@ hy2_port_answer() {
 
 converge() {
     local title="$1" name="$2"
-    log ""
-    log "== ${title} =="
+    step "$title"
     if "check_${name}"; then
-        log "Соответствует, изменений нет."
+        report_ok "без изменений"
+        step_end
         return 0
     fi
-    "apply_${name}" || die "${title}: не удалось привести к целевому состоянию."
-    log "Повторная проверка."
-    "check_${name}" || die "${title}: после изменений проверка не пройдена."
-    log "Готово."
+    "apply_${name}" || die "не удалось привести к целевому состоянию"
+    log_quiet "Повторная проверка."
+    "check_${name}" || die "после изменений проверка не пройдена"
+    report_ok "готово"
+    step_end
 }
 
 # ОТВЕТЫ ПОЛЬЗОВАТЕЛЯ
@@ -1772,7 +1810,7 @@ resolve_paths() {
     resolve_path SUB_PATH "Секретный путь подписки" "$(json_get "$discovered" sub_path)"
     resolve_path PANEL_PATH "Секретный путь панели" "$(json_get "$discovered" web_base_path)"
     if paths_conflict; then
-        log "Пути XHTTP, подписки и панели должны различаться и не входить один в другой."
+        log "Пути XHTTP, подписки и панели совпадают или вложены друг в друга."
         for key in $(xhttp_enabled && echo XHTTP_PATH) SUB_PATH PANEL_PATH; do
             CONF[$key]=""
         done
@@ -1863,6 +1901,7 @@ ask_hy2_port() {
     local -n _hy2_out="$1"
     local _hy2_own="$2" _hy2_value _hy2_reason
     while true; do
+        prompted
         read -r -p "Порт Hysteria2 (UDP) (Enter — ${HY2_DEFAULT_PORT}, r — случайный ${HY2_RANDOM_MIN}–${HY2_RANDOM_MAX}): " _hy2_value || die "Ввод прерван."
         _hy2_value="${_hy2_value:-$HY2_DEFAULT_PORT}"
         if [[ "${_hy2_value,,}" == r ]]; then
@@ -2052,7 +2091,7 @@ nginx_write_http_files() {
     dir=$(acme_challenge_dir)
     rm -f "${NGINX_SITES_ENABLED}/default"
     while IFS= read -r f; do
-        [[ -n "$f" ]] && rm -f "$f" && log "  удалён ${f}"
+        [[ -n "$f" ]] && rm -f "$f" && log "удалён ${f}"
     done < <(nginx_stale_http_sites)
     mkdir -p "$dir" && chmod 755 "$ACME_WEBROOT" "${ACME_WEBROOT}/.well-known" "$dir"
     render_nginx_http_reject > "$NGINX_HTTP_REJECT_CONF"
@@ -2077,7 +2116,7 @@ apply_http() {
     fi
     nginx_apply nginx_write_http_files nginx_listens_http || return 1
     if ufw_present && ! ufw_allows "${HTTP_PORT}/tcp"; then
-        ufw allow "${HTTP_PORT}/tcp" comment "$SCRIPT_NAME" > /dev/null 2>&1 && log "  ufw: добавлено ${HTTP_PORT}/tcp."
+        ufw allow "${HTTP_PORT}/tcp" comment "$SCRIPT_NAME" > /dev/null 2>&1 && log "ufw: добавлено ${HTTP_PORT}/tcp"
     fi
     return 0
 }
@@ -2113,17 +2152,17 @@ acme_set_webroot() {
     local conf backup
     conf=$(acme_domain_conf)
     if ! grep -q '^Le_Webroot=' "$conf" 2> /dev/null; then
-        log "Нет строки Le_Webroot в ${conf}."
+        log "Нет строки Le_Webroot в ${conf}"
         return 1
     fi
     backup="${conf}.bak-$(date +%F-%H%M%S)"
     cp -p "$conf" "$backup" || return 1
     sed -i "s|^Le_Webroot=.*|Le_Webroot='${ACME_WEBROOT}'|" "$conf"
     if ! acme_webroot_set; then
-        log "Не удалось записать Le_Webroot='${ACME_WEBROOT}' в ${conf}."
+        log "Не удалось записать Le_Webroot='${ACME_WEBROOT}' в ${conf}"
         return 1
     fi
-    log "acme.sh: Le_Webroot='${ACME_WEBROOT}' в ${conf}, копия: ${backup}."
+    log "acme.sh: Le_Webroot='${ACME_WEBROOT}' в ${conf}, копия: ${backup}"
 }
 
 render_cert_renew() {
@@ -2162,7 +2201,7 @@ acme_cron_present() {
 check_cert() {
     local rc=0
     if ! cert_valid "$(conf_get DOMAIN)" "$(cert_dir)"; then
-        mismatch "сертификата $(cert_dir)/fullchain.pem для $(conf_get DOMAIN) нет, он истекает в течение 30 дней или не совпадает с ключом"
+        mismatch "сертификат $(cert_dir)/fullchain.pem для $(conf_get DOMAIN) отсутствует, истекает в течение 30 дней или не совпадает с ключом"
         rc=1
     fi
     acme_webroot_set || {
@@ -2198,38 +2237,38 @@ issue_cert() {
     domain=$(conf_get DOMAIN)
     dir=$(cert_dir)
     if [[ ! -x "$ACME" ]]; then
-        log "Установка acme.sh."
+        log "Установка acme.sh"
         curl -fsSL https://get.acme.sh | sh -s email="$(conf_get ACME_EMAIL)" >> "$LOG_FILE" 2>&1
         [[ -x "$ACME" ]] || {
-            log "Не удалось установить acme.sh."
+            log "Не удалось установить acme.sh"
             return 1
         }
     fi
     "$ACME" --set-default-ca --server letsencrypt >> "$LOG_FILE" 2>&1 || true
     for attempt in 1 2; do
-        log "Выпуск сертификата для ${domain} (HTTP-01, webroot ${ACME_WEBROOT})."
+        log "Выпуск сертификата для ${domain} (HTTP-01, webroot ${ACME_WEBROOT})"
         "$ACME" --issue -d "$domain" --keylength ec-256 -w "$ACME_WEBROOT" >> "$LOG_FILE" 2>&1
         rc=$?
         [[ "$rc" -eq 0 || "$rc" -eq 2 ]] && break
         if [[ "$attempt" -eq 1 ]]; then
-            log "acme.sh завершился с кодом ${rc}, повторная попытка через 10 с."
+            log "acme.sh завершился с кодом ${rc}, повторная попытка через 10 с"
             sleep 10
         fi
     done
     if [[ "$rc" -ne 0 && "$rc" -ne 2 ]]; then
-        log "acme.sh не выпустил сертификат (код ${rc}). Проверьте A-запись домена, доступность ${HTTP_PORT}/tcp снаружи и лог ${LOG_FILE}."
+        log "acme.sh не выпустил сертификат, код ${rc}. Возможные причины: A-запись домена указывает не на этот сервер, ${HTTP_PORT}/tcp закрыт снаружи"
         return 1
     fi
     acme_webroot_set || acme_set_webroot || return 1
     acme_install_cert "$domain" "$dir"
     if ! cert_valid "$domain" "$dir" && [[ "$rc" -eq 2 ]]; then
-        log "Сертификат acme.sh не подходит, перевыпуск."
+        log "Сертификат acme.sh не подходит, перевыпуск"
         "$ACME" --renew -d "$domain" --ecc --force >> "$LOG_FILE" 2>&1
         acme_install_cert "$domain" "$dir"
     fi
     chmod 600 "${dir}/privkey.pem" 2> /dev/null
     cert_valid "$domain" "$dir" || {
-        log "Сертификат не установлен в ${dir}."
+        log "Сертификат не установлен в ${dir}"
         return 1
     }
 }
@@ -2246,11 +2285,11 @@ apply_cert() {
         crontab -l -u root 2> /dev/null | grep -vF "$CERT_RENEW" | grep -v 'acme.sh --cron'
         echo "17 3 * * * ${CERT_RENEW}"
     } | crontab -u root - || {
-        log "Не удалось записать задачу cron."
+        log "Не удалось записать задачу cron"
         return 1
     }
     "$CERT_RENEW" >> "$LOG_FILE" 2>&1
-    log "Автопродление: ${CERT_RENEW}, cron root, ежедневно в 03:17."
+    log "Автопродление: ${CERT_RENEW}, cron root, ежедневно в 03:17"
 }
 
 # УСТАНОВКА 3X-UI И ПЕРЕНОС БАЗЫ
@@ -2262,7 +2301,7 @@ check_xui() {
         return 1
     fi
     version="v$("$XUI_BIN" -v 2> /dev/null)"
-    log "  3x-ui ${version}"
+    log "3x-ui ${version}"
     if [[ "$version" != "$XUI_SUPPORTED_VERSION" ]]; then
         warn_lines <<< "3x-ui ${version}: со скриптом проверена ${XUI_SUPPORTED_VERSION}"
     fi
@@ -2304,6 +2343,7 @@ resolve_xui_version() {
     echo "  1 — ${XUI_SUPPORTED_VERSION}, проверена со скриптом"
     echo "  2 — ${latest}, последняя, со скриптом не проверена"
     while true; do
+        prompted
         read -r -p "Выбор (Enter — 1): " choice || die "Ввод прерван."
         case "${choice:-1}" in
             1) return 0 ;;
@@ -2312,32 +2352,31 @@ resolve_xui_version() {
                 return 0
                 ;;
         esac
-        echo "  Введите 1 или 2."
+        echo "  Ожидается 1 или 2."
     done
 }
 
 install_xui() {
     local installer version="${XUI_VERSION:-$XUI_SUPPORTED_VERSION}"
-    log "Установка 3x-ui ${version} (1–3 минуты)."
+    log "Установка 3x-ui ${version} (1–3 минуты)"
     installer=$(mktemp)
     if ! curl -fsSL "https://raw.githubusercontent.com/${XUI_REPO}/${version}/install.sh" -o "$installer"; then
         rm -f "$installer"
-        log "Не удалось скачать установщик 3x-ui ${version}."
+        log "Не удалось скачать установщик 3x-ui ${version}"
         return 1
     fi
     bash "$installer" "$version" < /dev/null >> "$LOG_FILE" 2>&1
     rm -f "$installer"
     [[ -x "$XUI_BIN" ]] || {
-        log "Установка 3x-ui завершилась с ошибкой."
+        log "Установка 3x-ui завершилась с ошибкой"
         return 1
     }
-    log "3x-ui $("$XUI_BIN" -v 2> /dev/null) установлен."
 }
 
 import_db() {
     local src="$1" work report bin newer
     bin=$(xray_bin) || {
-        log "xray-core не найден."
+        log "xray-core не найден"
         return 1
     }
     work=$(mktemp -d)
@@ -2352,7 +2391,7 @@ import_db() {
         rm -rf "$work"
         log "База ${src} создана более новой версией 3x-ui, чем установленная v$("$XUI_BIN" -v 2> /dev/null):"
         log_lines "  " <<< "$newer"
-        log "Нужна 3x-ui той же версии, что на исходном сервере, или новее."
+        log "Требуется 3x-ui той же версии, что на исходном сервере, или новее"
         return 1
     fi
     if ! report=$(py import-prepare "${work}/x-ui.db" "$bin" "$(conf_get DOMAIN)" "$REALITY_TARGET"); then
@@ -2365,7 +2404,7 @@ import_db() {
     mkdir -p "$(dirname "$XUI_DB")"
     if ! cp "${work}/x-ui.db" "$XUI_DB"; then
         rm -rf "$work"
-        log "Не удалось записать ${XUI_DB}."
+        log "Не удалось записать ${XUI_DB}"
         return 1
     fi
     rm -f "${XUI_DB}-wal" "${XUI_DB}-shm"
@@ -2374,10 +2413,10 @@ import_db() {
     conf_unset XHTTP XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH XUI_CREDENTIALS_PENDING \
         HY2 HY2_PORT CLIENT_NAME
     IMPORTED_NOW=1
-    log "База перенесена из ${src}."
+    log "База перенесена из ${src}"
     [[ "$(json_get "$report" kept)" != "[]" ]] && log "Ключи Reality сохранены: $(json_get "$report" kept)."
     [[ "$(json_get "$report" rekeyed)" != "[]" ]] && log "Ключи Reality выпущены заново: $(json_get "$report" rekeyed)."
-    [[ "$TWO_FA_RESET" -eq 1 ]] && log "2FA из базы отключена, включите её заново в панели."
+    [[ "$TWO_FA_RESET" -eq 1 ]] && log "2FA из базы отключена"
     xui_start
 }
 
@@ -2549,11 +2588,11 @@ nginx_remove_stale_rejects() {
         [[ -n "$f" ]] || continue
         if [[ -L "$f" ]]; then
             rm -f "$f"
-            log "  отключён устаревший антискан ${f}"
+            log "отключён устаревший антискан ${f}"
             continue
         fi
         backup="/root/$(basename "$f").bak-$(date +%F-%H%M%S)"
-        mv "$f" "$backup" && log "  устаревший антискан ${f} перенесён в ${backup}"
+        mv "$f" "$backup" && log "устаревший антискан ${f} перенесён в ${backup}"
     done < <(nginx_stale_rejects)
 }
 
@@ -2569,10 +2608,10 @@ prepare_stub_site() {
     stub_ready && return 0
     mkdir -p "$dir"
     if [[ ! -s "${dir}/index.html" ]]; then
-        echo ""
-        echo "Папка сайта-заглушки: ${dir}"
-        echo "Можно положить туда index.html и фавиконку (favicon.ico, .svg или .png)."
-        read -r -p "Enter — продолжить: " || die "Ввод прерван."
+        echo "${INDENT}Папка сайта-заглушки: ${dir}"
+        echo "${INDENT}Можно положить туда index.html и фавиконку (favicon.ico, .svg или .png)."
+        prompted
+        read -r -p "${INDENT}Enter — продолжить: " || die "Ввод прерван."
     fi
     for candidate in favicon.ico favicon.svg favicon.png; do
         if [[ -s "${dir}/${candidate}" ]]; then
@@ -2585,7 +2624,7 @@ prepare_stub_site() {
         base64 -d > "${dir}/favicon.ico" << 'B64EOF'
 AAABAAIAEBAAAAAAIAAtAQAAJgAAACAgAAAAACAApQAAAFMBAACJUE5HDQoaCgAAAA1JSERSAAAAEAAAABAIBgAAAB/z/2EAAAD0SURBVHic7ZMxTsNAEEX/zO46WPGZaAM0uYVBaVAOgCLEARANSnKLVJCWMzk4eHb3U6SIIkVGVlq+NOV7+lN8qetVWK/v7eHx6XY8rq5/2n0i6HAmAkmj8srtds3X8u3lo65XQQBgNl/chFBsfAgFcz7HHiWqiGadWTd9f33+lNl8cedd2BDZ5ZwiKdIrEFLVeYGmmGzqRWQSiuDb9ttEJPTjh0dSSlaWo5D2caIgGjIT+Bs97ZEJolEAOgw+SgCoDgdP8y84CDJADkdJAFkhqERUhklIERUIKiW5tc6ic84DNBKx7wCac85bZ5Hk9vIxXTrnX31kpEilEQNGAAAAAElFTkSuQmCCiVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAbElEQVR4nO3XsQ0AIQwDwLzXpfsJmOA75oWK4hMQVUxjl4DwSaTB7HKe1WJ5a88oa18NfWCV7+7G6UA2ArsNFgLsco8IM8COAAIIIIAAAggggAACwGz9Y8nO7IRfYJb/ACyE7wgzkIm48dTHDMFSJDwZtkmoAAAAAElFTkSuQmCC
 B64EOF
-        log "Фавиконка не найдена, установлена стандартная."
+        log "фавиконка не найдена, установлена стандартная"
     fi
     if [[ ! -s "${dir}/index.html" ]]; then
         cat > "${dir}/index.html" << EOF
@@ -2602,17 +2641,17 @@ B64EOF
 </body>
 </html>
 EOF
-        log "index.html не найден, установлена заглушка 403 Forbidden."
+        log "index.html не найден, установлена страница 403 Forbidden"
     fi
     stub_ready
 }
 
 install_nginx() {
     command -v nginx > /dev/null 2>&1 && return 0
-    log "Установка nginx."
+    log "Установка nginx"
     export DEBIAN_FRONTEND=noninteractive
     if ! apt-get update -qq >> "$LOG_FILE" 2>&1 || ! apt-get install -y -qq nginx >> "$LOG_FILE" 2>&1; then
-        log "Не удалось установить nginx."
+        log "Не удалось установить nginx"
         return 1
     fi
 }
@@ -2659,14 +2698,14 @@ nginx_apply() {
     fi
     rm -f "$snapshot"
     if ! nginx_reload; then
-        log "nginx не перезагрузился. Журнал nginx записан в лог."
+        log "nginx не перезагрузился, журнал nginx записан в ${LOG_FILE}"
         journal_tail nginx
         return 1
     fi
     if ! wait_for 15 "$listening"; then
         systemctl restart nginx > /dev/null 2>&1
         if ! wait_for 10 "$listening"; then
-            log "nginx слушает: $(nginx_addresses | tr '\n' ' ')— нужно: $(nginx_expected_text). Проверьте другие конфиги в ${NGINX_SITES_ENABLED} и ${NGINX_CONF_D}."
+            log "nginx слушает: $(nginx_addresses | tr '\n' ' ')ожидается: $(nginx_expected_text); адреса задают другие конфиги в ${NGINX_SITES_ENABLED} или ${NGINX_CONF_D}"
             return 1
         fi
     fi
@@ -2743,7 +2782,7 @@ apply_nginx() {
     local foreign
     install_nginx || return 1
     prepare_stub_site || {
-        log "Не удалось подготовить сайт-заглушку в $(www_dir)."
+        log "Не удалось подготовить сайт-заглушку в $(www_dir)"
         return 1
     }
     foreign=$(nginx_foreign_public_listeners)
@@ -2828,7 +2867,7 @@ apply_panel() {
     xui_stop
     backup_db_once
     if ! "$XUI_BIN" setting "${args[@]}" >> "$LOG_FILE" 2>&1; then
-        log "x-ui setting завершился с ошибкой."
+        log "x-ui setting завершился с ошибкой"
         xui_start
         return 1
     fi
@@ -2967,7 +3006,7 @@ fix_inbounds() {
     target=$(json_get "$report" reality.target)
     port=$(json_get "$report" reality.port)
     if [[ -n "$target" && "$target" != "$REALITY_TARGET" ]]; then
-        log "После записи target Reality «${target}», а не ${REALITY_TARGET}. Остановлено, чтобы не получить петлю."
+        log "target Reality после записи: ${target}, ожидался ${REALITY_TARGET}; остановка, возможна петля"
         xui_start
         return 1
     fi
@@ -3006,10 +3045,10 @@ create_missing_inbounds() {
     fi
     log_quiet "$report"
     json_lines "$report" created | while IFS= read -r line; do
-        log "  создан: $(json_get "$line" kind) $(json_get "$line" tag), порт $(json_get "$line" port)"
+        log "создан инбаунд $(json_get "$line" kind) $(json_get "$line" tag), порт $(json_get "$line" port)"
     done
     if [[ -n "$(json_get "$report" new_client)" ]]; then
-        log "  клиент «$(json_get "$report" new_client.email)» добавлен во все инбаунды."
+        log "клиент $(json_get "$report" new_client.email) добавлен во все инбаунды"
     fi
 }
 
@@ -3082,10 +3121,10 @@ apply_hosts() {
             log "Не удалось добавить Хосты: ${report}"
             return 1
         }
-        json_lines "$report" added | log_lines "  добавлен Хост "
+        json_lines "$report" added | log_lines "добавлен Хост "
     fi
     if [[ -n "$(json_lines "$(inbounds_report plan)" problems)" ]]; then
-        log "После записи Хостов изменился инбаунд, возвращаю настройки."
+        log "После записи Хостов изменился инбаунд, настройки инбаунда возвращены"
         fix_inbounds || return 1
     fi
     xui_restart
@@ -3132,7 +3171,7 @@ apply_routing() {
         log "Проверка routeTest не пройдена: $(json_get "$report" failed)"
         return 1
     }
-    log "  routeTest: правила работают."
+    log "routeTest: правила срабатывают"
 }
 
 # UFW
@@ -3182,7 +3221,7 @@ ufw_stale_rules() {
 check_ufw() {
     local rc=0 rule
     if ! ufw_present; then
-        log "  ufw не установлен. Откройте в своём файрволе: $(ufw_target_rules | tr '\n' ' ')"
+        log "ufw не установлен, порты для внешнего файрвола: $(ufw_target_rules | tr '\n' ' ')"
         return 0
     fi
     while IFS= read -r rule; do
@@ -3198,7 +3237,7 @@ apply_ufw() {
     local rule
     while IFS= read -r rule; do
         ufw_allows "$rule" && continue
-        ufw allow "$rule" comment "$SCRIPT_NAME" > /dev/null 2>&1 && log "  ufw: добавлено ${rule}."
+        ufw allow "$rule" comment "$SCRIPT_NAME" > /dev/null 2>&1 && log "ufw: добавлено ${rule}"
     done < <(ufw_target_rules)
 }
 
@@ -3220,7 +3259,7 @@ apply_ufw_cleanup() {
         for i in 1 2 3; do
             ufw --force delete allow "$rule" > /dev/null 2>&1 || break
         done
-        log "  ufw: удалено ${rule}."
+        log "ufw: удалено ${rule}"
     done < <(ufw_stale_rules)
 }
 
@@ -3232,7 +3271,7 @@ expect_tls() {
     if [[ "$got" == "$want" ]]; then
         report_ok "${host}:${port}, ${what}: $([[ "$got" == cert ]] && echo 'свой сертификат' || echo 'отказ')"
     else
-        report_fail "${host}:${port}, ${what}: $([[ "$got" == cert ]] && echo 'выдан сертификат' || echo 'отказ'), ожидалось обратное"
+        report_fail "${host}:${port}, ${what}: $([[ "$got" == cert ]] && echo 'выдан сертификат, ожидался отказ' || echo 'отказ, ожидался сертификат')"
     fi
 }
 
@@ -3384,7 +3423,7 @@ final_subscription_checks() {
     endpoints=$(py sub-endpoints <<< "$body")
     report_ok "подписка через ${PUBLIC_TLS_PORT}: 200, ссылки:"
     py json-lines "{\"items\": ${endpoints}}" items | while IFS= read -r line; do
-        log "           $(json_get "$line" scheme)://…@$(json_get "$line" host):$(json_get "$line" port) $(json_get "$line" type) $(json_get "$line" security)"
+        log "  $(json_get "$line" scheme)://…@$(json_get "$line" host):$(json_get "$line" port) $(json_get "$line" type) $(json_get "$line" security)"
     done
     hy2_port=$(hy2_port_answer)
     py_expect_endpoint "$endpoints" vless "$domain" "$PUBLIC_TLS_PORT" reality "VLESS Reality"
@@ -3445,7 +3484,7 @@ final_service_checks() {
         fi
     done
     if ! ufw_present; then
-        report_warn "ufw не установлен: откройте только $(ufw_target_rules | tr '\n' ' ')"
+        report_warn "ufw не установлен, порты для внешнего файрвола: $(ufw_target_rules | tr '\n' ' ')"
         return
     fi
     while IFS= read -r rule; do
@@ -3458,10 +3497,10 @@ final_service_checks() {
     extra=$(ufw_simple_rules | cut -d'|' -f1 | grep -vxF -f <(ufw_target_rules) | grep -vxF -f <(ufw_target_rules | cut -d/ -f1) \
         | grep -vxF -f <(ufw_stale_rules; echo "-") | tr '\n' ' ')
     if [[ -n "${extra// /}" ]]; then
-        report_warn "в ufw есть другие правила: ${extra}— проверьте, нужны ли они"
+        report_warn "в ufw есть другие правила: ${extra% }"
     fi
     if ! ufw status 2> /dev/null | grep -q 'Status: active'; then
-        report_warn "ufw выключен: правила не действуют. Разрешите SSH-порт и выполните ufw enable."
+        report_warn "ufw выключен, правила не действуют"
     fi
 }
 
@@ -3483,24 +3522,323 @@ final_checks() {
     [[ "$FINAL_OK" -eq 1 ]]
 }
 
+# УДАЛЕНИЕ
+
+xui_files() {
+    local unit
+    unit=$(systemctl show -p FragmentPath --value x-ui 2> /dev/null)
+    printf '%s\n' "${unit:-/etc/systemd/system/x-ui.service}" /etc/systemd/system/x-ui.service.d /usr/bin/x-ui \
+        /usr/local/x-ui /etc/x-ui /etc/default/x-ui /var/log/x-ui \
+        /etc/fail2ban/jail.d/3x-ipl.conf /etc/fail2ban/jail.d/3x-ipl-backend.conf \
+        /etc/fail2ban/filter.d/3x-ipl.conf /etc/fail2ban/action.d/3x-ipl.conf
+}
+
+nginx_files() {
+    local f
+    while IFS= read -r f; do
+        [[ -f "$f" || -L "$f" ]] && printf '%s\n' "$f"
+    done < <(nginx_managed_files)
+}
+
+acme_domain_dirs() {
+    local domain
+    domain=$(conf_get DOMAIN)
+    [[ -n "$domain" ]] || return 0
+    printf '%s\n' "/root/.acme.sh/${domain}_ecc" "/root/.acme.sh/${domain}"
+}
+
+acme_other_domains() {
+    local own dir
+    own=" $(acme_domain_dirs | tr '\n' ' ') "
+    find /root/.acme.sh -mindepth 1 -maxdepth 1 -type d -name '*.*' 2> /dev/null | while IFS= read -r dir; do
+        [[ "$own" == *" ${dir} "* ]] || basename "$dir"
+    done
+}
+
+cert_files() {
+    local folder
+    folder=$(conf_get CERT_FOLDER)
+    printf '%s\n' "$CERT_RENEW" /var/log/cert-renew.log "$ACME_WEBROOT"
+    acme_domain_dirs
+    [[ "$folder" =~ $FOLDER_RE ]] && printf '/etc/ssl/%s\n' "$folder"
+}
+
+script_ufw_rules() {
+    local ssh rule comment
+    ufw_present || return 0
+    ssh=" $(ssh_ports | tr '\n' ' ') "
+    while IFS='|' read -r rule comment; do
+        [[ "$comment" == "$SCRIPT_NAME" ]] || continue
+        [[ "$rule" != */udp && "$ssh" == *" ${rule%/tcp} "* ]] && continue
+        printf '%s\n' "$rule"
+    done < <(ufw_simple_rules)
+}
+
+rest_files() {
+    local folder
+    folder=$(conf_get CERT_FOLDER)
+    [[ "$folder" =~ $FOLDER_RE ]] && printf '/var/www/%s\n' "$folder"
+    compgen -G '/root/nginx-*.tgz' || true
+    printf '%s\n' "$CONF_FILE" "$LOG_FILE"
+}
+
+existing() {
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" && (-e "$f" || -L "$f") ]] && printf '%s\n' "$f"
+    done
+}
+
+installed_packages() {
+    dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' "$@" 2> /dev/null | awk '$1 == "ii" {print $2}'
+}
+
+remove_paths() {
+    local f
+    while IFS= read -r f; do
+        rm -rf -- "$f" && log "удалён ${f}"
+    done
+}
+
+uninstall_xui() {
+    local files backup f2b=0
+    files=$(xui_files | existing)
+    systemctl disable --now x-ui > /dev/null 2>&1
+    if [[ -s "$XUI_DB" ]]; then
+        backup="/root/x-ui.db.$(date +%F-%H%M%S)"
+        cp -p "$XUI_DB" "$backup" || die "не удалось скопировать ${XUI_DB}"
+        log "копия базы: ${backup}"
+    fi
+    [[ "$files" == *"/etc/fail2ban/"* ]] && f2b=1
+    remove_paths <<< "$files"
+    systemctl daemon-reload > /dev/null 2>&1
+    systemctl reset-failed x-ui > /dev/null 2>&1
+    if ((f2b)) && systemctl is-active --quiet fail2ban; then
+        systemctl restart fail2ban > /dev/null 2>&1
+    fi
+    conf_unset XHTTP XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH \
+        XUI_CREDENTIALS_PENDING HY2 HY2_PORT CLIENT_NAME
+}
+
+uninstall_nginx() {
+    remove_paths < <(nginx_files)
+    if systemctl is-active --quiet nginx; then
+        if nginx -t > /dev/null 2>&1; then
+            systemctl reload nginx > /dev/null 2>&1
+        else
+            report_warn "nginx -t: ошибка конфигурации после удаления"
+        fi
+    fi
+}
+
+uninstall_cert() {
+    local domain others
+    domain=$(conf_get DOMAIN)
+    if renew_cron_present; then
+        { crontab -l -u root 2> /dev/null | grep -vF "$CERT_RENEW" || true; } | crontab -u root - && log "удалена задача cron ${CERT_RENEW}"
+    fi
+    if [[ -x "$ACME" && -n "$domain" ]]; then
+        "$ACME" --remove -d "$domain" --ecc >> "$LOG_FILE" 2>&1
+    fi
+    remove_paths < <(cert_files | existing)
+    if [[ -x "$ACME" ]]; then
+        others=$(acme_other_domains | tr '\n' ' ')
+        if [[ -z "$others" ]]; then
+            "$ACME" --uninstall >> "$LOG_FILE" 2>&1
+            rm -rf /root/.acme.sh && log "удалён /root/.acme.sh"
+        else
+            log "acme.sh оставлен, другие домены: ${others% }"
+        fi
+    fi
+}
+
+uninstall_ufw() {
+    local rule
+    if ! ufw_present; then
+        log "ufw не установлен"
+        return 0
+    fi
+    while IFS= read -r rule; do
+        ufw --force delete allow "$rule" > /dev/null 2>&1 && log "ufw: удалено ${rule}"
+    done < <(script_ufw_rules)
+}
+
+uninstall_packages() {
+    local packages=("$@")
+    if ! DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "${packages[@]}" >> "$LOG_FILE" 2>&1; then
+        die "apt-get purge завершился с ошибкой"
+    fi
+    log "удалены пакеты: ${packages[*]}"
+    if [[ " ${packages[*]} " == *" nginx "* && "$(ls -A /var/www/html 2> /dev/null)" == index.nginx-debian.html ]]; then
+        rm -rf /var/www/html && log "удалён /var/www/html"
+        rmdir /var/www 2> /dev/null && log "удалён /var/www"
+    fi
+}
+
+uninstall_rest() {
+    local kept log_file="$LOG_FILE"
+    remove_paths < <(rest_files | grep -vxF "$log_file" | existing)
+    if [[ -z "$(installed_packages nginx)" ]]; then
+        rmdir /var/www 2> /dev/null && log "удалён /var/www"
+    fi
+    kept=$(compgen -G '/etc/nginx/snippets/xui-panel*.conf' | tr '\n' ' ')
+    [[ -n "$kept" ]] && log "оставлены файлы пользователя: ${kept% }"
+    LOG_FILE=/dev/null
+    rm -f "$log_file"
+    log "удалён ${log_file}"
+}
+
+uninstall_plan() {
+    local item="$1"
+    case "$item" in
+        xui)
+            xui_files | existing
+            [[ -s "$XUI_DB" ]] && echo "(копия базы сохраняется в /root/x-ui.db.<дата>)"
+            ;;
+        nginx) nginx_files ;;
+        cert)
+            renew_cron_present && echo "задача cron ${CERT_RENEW}"
+            cert_files | existing
+            [[ -x "$ACME" && -z "$(acme_other_domains)" ]] && echo "/root/.acme.sh"
+            ;;
+        ufw) script_ufw_rules ;;
+        rest) rest_files | existing ;;
+    esac
+}
+
+read_components() {
+    local -n _rc_out="$1"
+    local choice n
+    while true; do
+        prompted
+        read -r -p "Номера через пробел: " choice || die "Ввод прерван."
+        _rc_out=()
+        for n in $choice; do
+            if [[ ! "$n" =~ ^[1-5]$ ]]; then
+                _rc_out=()
+                break
+            fi
+            _rc_out+=("$n")
+        done
+        ((${#_rc_out[@]} > 0)) && return 0
+        echo "  Ожидаются номера 1–5."
+    done
+}
+
+run_uninstall() {
+    local -a numbers=() items=() packages=() candidates=()
+    local -A titles=([xui]="3x-ui" [nginx]="nginx" [cert]="Сертификат" [ufw]="ufw" [rest]="Прочие файлы")
+    local -A picked=()
+    local item n line plan folder
+    if [[ ! -t 0 ]]; then
+        echo "--uninstall: нужен ввод с терминала" >&2
+        exit 1
+    fi
+    init_log
+    trap 'die "Прервано."' INT TERM HUP
+    conf_load
+    [[ -n "$(conf_get DOMAIN)" ]] || CONF[DOMAIN]=$(discover_domain)
+    if [[ -z "$(conf_get CERT_FOLDER)" ]]; then
+        folder=$(discover_cert_folder)
+        CONF[CERT_FOLDER]="${folder:-$(conf_get DOMAIN)}"
+    fi
+    emit "${SCRIPT_NAME} --uninstall, журнал: ${LOG_FILE}"
+    if [[ -n "$(conf_get DOMAIN)" ]]; then
+        emit "Домен: $(conf_get DOMAIN)"
+    else
+        emit "Домен не определён: файлы сайта nginx, сертификата и заглушки не найдены"
+    fi
+    emit ""
+    emit "Компоненты:"
+    emit "  1  3x-ui: панель, Xray, база, служба x-ui, jail fail2ban 3x-ipl"
+    emit "  2  nginx: конфиги сайта, антискан, порт 80"
+    emit "  3  сертификат: $(cert_dir), acme.sh, cert-renew.sh, задача cron"
+    emit "  4  правила ufw с комментарием ${SCRIPT_NAME}, кроме SSH"
+    emit "  5  всё перечисленное, сайт-заглушка, файл ответов, журнал, архивы /root/nginx-*.tgz"
+    read_components numbers
+    for n in "${numbers[@]}"; do
+        case "$n" in
+            1) picked[xui]=1 ;;
+            2) picked[nginx]=1 ;;
+            3) picked[cert]=1 ;;
+            4) picked[ufw]=1 ;;
+            5) picked=([xui]=1 [nginx]=1 [cert]=1 [ufw]=1 [rest]=1) ;;
+        esac
+    done
+    for item in xui nginx cert ufw rest; do
+        [[ -n "${picked[$item]:-}" ]] && items+=("$item")
+    done
+    [[ -n "${picked[nginx]:-}" ]] && mapfile -t -O "${#candidates[@]}" candidates < <(installed_packages 'nginx*' 'libnginx-mod-*')
+    [[ -n "${picked[xui]:-}" ]] && mapfile -t -O "${#candidates[@]}" candidates < <(installed_packages fail2ban)
+    if ((${#candidates[@]} > 0)) && ask_yes_no "Удалить пакеты: ${candidates[*]}?" n; then
+        packages=("${candidates[@]}")
+    fi
+
+    emit ""
+    emit "Будет удалено:"
+    for item in "${items[@]}"; do
+        emit "  ${titles[$item]}:"
+        plan=$(uninstall_plan "$item")
+        if [[ -n "$plan" ]]; then
+            while IFS= read -r line; do emit "    ${line}"; done <<< "$plan"
+        else
+            emit "    нечего удалять"
+        fi
+    done
+    ((${#packages[@]} > 0)) && emit "  Пакеты: ${packages[*]}"
+    if [[ -n "${picked[nginx]:-}" && -z "${picked[xui]:-}" && -x "$XUI_BIN" ]]; then
+        emit "! 3x-ui остаётся: Reality без nginx на ${REALITY_TARGET} не работает"
+    fi
+    if [[ -n "${picked[cert]:-}" && (-z "${picked[nginx]:-}" || -z "${picked[xui]:-}") ]]; then
+        emit "! nginx и Hysteria2 используют сертификат из $(cert_dir)"
+    fi
+    ask_yes_no "Удалить?" n || {
+        emit "Отменено."
+        exit 0
+    }
+
+    STEP_TOTAL=$((${#items[@]} + (${#packages[@]} > 0 ? 1 : 0)))
+    emit ""
+    for item in "${items[@]}"; do
+        if [[ "$item" == rest ]] && ((${#packages[@]} > 0)); then
+            step "Пакеты"
+            uninstall_packages "${packages[@]}"
+            report_ok "готово"
+            step_end
+            packages=()
+        fi
+        step "${titles[$item]}"
+        "uninstall_${item}"
+        report_ok "готово"
+        step_end
+    done
+    if ((${#packages[@]} > 0)); then
+        step "Пакеты"
+        uninstall_packages "${packages[@]}"
+        report_ok "готово"
+        step_end
+    fi
+    emit "Удаление завершено."
+    exit 0
+}
+
 # ЗАПУСК
 
 panel_password_text() {
     if [[ -n "$(conf_get XUI_PASSWORD)" && "$(py panel-user "$XUI_DB" password)" == "$(conf_get XUI_PASSWORD_HASH)" ]]; then
         conf_get XUI_PASSWORD
     else
-        printf 'задан не этим скриптом, новый: sudo bash %s --reconfigure' "${0##*/}"
+        printf 'задан вне скрипта, смена: sudo bash %s --reconfigure' "${0##*/}"
     fi
 }
 
 print_summary() {
-    log ""
     log "Установка завершена."
     log "Панель:    https://$(conf_get DOMAIN)$(conf_get PANEL_PATH)/"
     log "Логин:     $(py panel-user "$XUI_DB" username)"
     log "Пароль:    $(panel_password_text)"
     log "Подписка:  https://$(conf_get DOMAIN)$(conf_get SUB_PATH)/$(json_get "$(xui_discover)" sub_id)"
-    [[ "$TWO_FA_RESET" -eq 1 ]] && log "2FA панели отключена при импорте, включите её заново."
+    [[ "$TWO_FA_RESET" -eq 1 ]] && log "2FA:       отключена при импорте"
     return 0
 }
 
@@ -3548,18 +3886,17 @@ check_resolve_answers() {
 
 check_step() {
     local title="$1" name="$2"
-    log ""
-    log "== ${title} =="
+    step "$title"
     if "check_${name}"; then
         report_ok "соответствует"
     fi
-    return 0
+    step_end
 }
 
 run_check() {
     LOG_FILE=/dev/null
     trap 'exit 2' INT TERM HUP
-    log "Проверка ${SCRIPT_NAME}, без изменений."
+    emit "${SCRIPT_NAME} --check: проверка без изменений на сервере"
     check_tools || exit 2
     load_py_helper
     conf_load
@@ -3567,6 +3904,8 @@ run_check() {
         report_fail "домен не определён: нет файла ответов ${CONF_FILE} и server_name в конфигах nginx"
         exit 2
     fi
+    STEP_TOTAL=$((5 + $(xui_has_config && echo 6 || echo 0) + $(ufw_present && echo 1 || echo 0)))
+    emit ""
     check_step "nginx: порт 80" http
     check_step "Сертификат" cert
     check_step "3x-ui" xui
@@ -3578,15 +3917,14 @@ run_check() {
         check_step "Хосты" hosts
         check_step "Маршрутизация" routing
     else
-        log ""
         report_fail "в ${XUI_DB} нет инбаундов 3x-ui: проверки nginx, панели, подписки, инбаундов, Хостов и маршрутизации пропущены"
+        emit ""
     fi
     check_step "ufw" ufw
     ufw_present && check_step "ufw: лишние правила" ufw_cleanup
-    log ""
-    log "== Финальная проверка =="
+    step "Проверка"
     final_checks
-    log ""
+    step_end
     if [[ "$FAIL_COUNT" -eq 0 ]]; then
         log "Проверка завершена: ошибок нет."
         exit 0
@@ -3598,13 +3936,15 @@ run_check() {
 main() {
     parse_args "$@"
     if [[ "$(id -u)" -ne 0 ]]; then
-        echo "Запустите от root: sudo bash ${0##*/}" >&2
+        echo "Нужен root: sudo bash ${0##*/}" >&2
         exit $((CHECK_ONLY == 1 ? 2 : 1))
     fi
     [[ "$CHECK_ONLY" -eq 1 ]] && run_check
+    [[ "$UNINSTALL" -eq 1 ]] && run_uninstall
     init_log
     trap 'die "Прервано. Повторный запуск продолжит с текущего состояния."' INT TERM HUP
-    log "Запуск ${SCRIPT_NAME}. Лог: ${LOG_FILE}"
+    STEP_TOTAL=12
+    emit "${SCRIPT_NAME}, журнал: ${LOG_FILE}"
     ensure_packages
     load_py_helper
     conf_load
@@ -3627,9 +3967,9 @@ main() {
     converge "Хосты" hosts
     converge "Маршрутизация" routing
     converge "ufw" ufw
-    log ""
-    log "== Финальная проверка =="
-    final_checks || die "Финальная проверка не пройдена."
+    step "Проверка"
+    final_checks || die "проверка не пройдена"
+    step_end
     converge "ufw: лишние правила" ufw_cleanup
     print_summary
 }
