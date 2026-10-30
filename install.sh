@@ -413,12 +413,17 @@ KINDS = ("reality", "xhttp", "hy2")
 KIND_NAMES = {"reality": "VLESS Reality", "xhttp": "VLESS XHTTP", "hy2": "Hysteria2"}
 SETTING_DEFAULTS = {"subEnable": "true", "subPort": "2096", "webPort": "2053"}
 INBOUND_FIELDS = ["id", "protocol", "port", "tag", "enable", "listen", "settings",
-                  "stream_settings", "remark", "node_id", "origin_node_guid"]
+                  "stream_settings", "sniffing", "remark", "node_id", "origin_node_guid"]
 CLIENT_KEYS = ("email", "enable", "subId", "limitIp", "totalGB", "expiryTime", "tgId",
                "comment", "reset", "group")
 RU_GEOIP = re.compile(r"^(geoip:ru|ext:[^:]+:ru)$", re.I)
-RULE_MATCH_KEYS = ("domain", "port", "sourcePort", "localPort", "network", "source", "sourceIP", "localIP",
+RULE_MATCH_KEYS = ("domain", "ip", "port", "sourcePort", "localPort", "network", "source", "sourceIP", "localIP",
                    "user", "inboundTag", "protocol", "attrs", "vlessRoute", "process")
+SNIFFING = {"enabled": True, "destOverride": ["http", "tls", "quic"], "metadataOnly": False, "routeOnly": True}
+BLOCK_IP = ["geoip:private", "ext:geoip_RU.dat:ru"]
+BLOCK_PROTOCOL = ["bittorrent"]
+BLOCK_DOMAIN = ["ext:geosite_RU.dat:ru-available-only-inside", "regexp:.*\\.ru$", "regexp:.*\\.su$",
+                "regexp:.*\\.xn--p1ai$", "ext:geosite_RU.dat:category-ads-all", "geosite:category-ads-all"]
 
 
 # ОБЩИЕ ФУНКЦИИ
@@ -488,6 +493,7 @@ def read_inbounds(cur):
         ib = dict(zip(INBOUND_FIELDS, row))
         ib["stream"] = as_dict(ib["stream_settings"])
         ib["conf"] = as_dict(ib["settings"])
+        ib["sniff"] = as_dict(ib["sniffing"])
         ib["own"] = ib["node_id"] is None and not (ib["origin_node_guid"] or "").strip()
         ib["active"] = enabled(ib["enable"])
         ib["kind"] = kind_of(ib["protocol"], ib["stream"])
@@ -668,6 +674,22 @@ def limit_fallback_active(rs):
     return active
 
 
+def sniffing_ok(sniffing):
+    if not isinstance(sniffing, dict):
+        return False
+    return (sniffing.get("enabled") is True and sorted(sniffing.get("destOverride") or []) == sorted(SNIFFING["destOverride"])
+            and not sniffing.get("metadataOnly") and sniffing.get("routeOnly") is True)
+
+
+def normalize_sniffing(ib, notes, fields):
+    if sniffing_ok(ib["sniff"]):
+        return
+    wanted = dict(ib["sniff"])
+    wanted.update(SNIFFING)
+    notes.append("sniffing → http, tls, quic, routeOnly")
+    fields["sniffing"] = json.dumps(wanted)
+
+
 def normalize_reality(ib, domain, target):
     stream = json.loads(json.dumps(ib["stream"]))
     notes, fields = [], {}
@@ -700,6 +722,7 @@ def normalize_reality(ib, domain, target):
     if (ib["listen"] or "").strip():
         notes.append(f"listen {ib['listen']} → пусто")
         fields["listen"] = ""
+    normalize_sniffing(ib, notes, fields)
     return stream, fields, notes
 
 
@@ -728,6 +751,7 @@ def normalize_xhttp(ib, domain, path):
     if ib["port"] != XHTTP_PORT:
         notes.append(f"порт {ib['port']} → {XHTTP_PORT}")
         fields["port"] = XHTTP_PORT
+    normalize_sniffing(ib, notes, fields)
     return stream, fields, notes
 
 
@@ -777,6 +801,7 @@ def normalize_hy2(ib, domain, cert_folder, port):
     if ib["port"] != port:
         notes.append(f"порт {ib['port']} → {port}")
         fields["port"] = port
+    normalize_sniffing(ib, notes, fields)
     return stream, fields, notes
 
 
@@ -815,7 +840,7 @@ def write_inbound(cur, ib_id, stream, fields):
     if stream is not None:
         assignments.append("stream_settings=?")
         values.append(json.dumps(stream))
-    for key in ("listen", "port", "tag", "enable"):
+    for key in ("listen", "port", "tag", "enable", "sniffing"):
         if key in fields:
             assignments.append(f"{key}=?")
             values.append(fields[key])
@@ -1199,7 +1224,7 @@ def cmd_create_missing(base, token, db, xray_bin, domain, cert_folder, xhttp_pat
             else:
                 body = hy2_inbound(p, clients)
             body.update({"up": 0, "down": 0, "total": 0, "enable": True, "expiryTime": 0,
-                         "sniffing": json.dumps({"enabled": False, "destOverride": ["http", "tls", "quic"]})})
+                         "sniffing": json.dumps(SNIFFING)})
             body["settings"] = json.dumps(body["settings"])
             body["streamSettings"] = json.dumps(body["streamSettings"])
             obj = api.call("panel/api/inbounds/add", body=body)
@@ -1232,16 +1257,28 @@ def cmd_hosts_add(base, token, missing_json):
 
 # МАРШРУТИЗАЦИЯ И CONFIG.JSON
 
-def is_ru_block(rule):
-    ips = rule.get("ip")
+def plain_block(rule, field):
     return (rule.get("outboundTag") == "blocked" and rule.get("enabled", True) is not False
-            and isinstance(ips, list) and any(RU_GEOIP.match(str(ip)) for ip in ips)
-            and not any(rule.get(key) for key in RULE_MATCH_KEYS))
+            and isinstance(rule.get(field), list)
+            and not any(rule.get(key) for key in RULE_MATCH_KEYS if key != field))
 
 
 def is_udp443_block(rule):
     return (rule.get("outboundTag") == "blocked" and (rule.get("network") or "").lower() == "udp"
             and str(rule.get("port")) == "443")
+
+
+def block_missing(rules):
+    have = {field: {str(v) for r in rules if plain_block(r, field) for v in r[field]}
+            for field in ("ip", "protocol", "domain")}
+    missing = {
+        "ip": [v for v in BLOCK_IP if v not in have["ip"]],
+        "protocol": [v for v in BLOCK_PROTOCOL if v not in have["protocol"]],
+        "domain": [v for v in BLOCK_DOMAIN if v not in have["domain"]],
+    }
+    if any(RU_GEOIP.match(v) for v in have["ip"]):
+        missing["ip"] = [v for v in missing["ip"] if not RU_GEOIP.match(v)]
+    return missing
 
 
 def cmd_config_summary(path):
@@ -1253,7 +1290,8 @@ def cmd_config_summary(path):
         kind = kind_of(ib.get("protocol"), stream)
         if kind == "other" or result[kind] is not None:
             continue
-        entry = {"tag": ib.get("tag") or "", "port": ib.get("port"), "listen": ib.get("listen") or ""}
+        entry = {"tag": ib.get("tag") or "", "port": ib.get("port"), "listen": ib.get("listen") or "",
+                 "sniffing": sniffing_ok(ib.get("sniffing"))}
         if kind == "reality":
             rs = stream.get("realitySettings") or {}
             entry["target"] = str(rs.get("target") or rs.get("dest") or "")
@@ -1264,21 +1302,66 @@ def cmd_config_summary(path):
     udp_rules = [r for r in rules if is_udp443_block(r)]
     expected = sorted({result[k]["tag"] for k in ("reality", "xhttp") if result[k]})
     actual = [sorted(set(r.get("inboundTag") or [])) for r in udp_rules]
-    result["ru_block"] = any(is_ru_block(r) for r in rules)
+    result["block_missing"] = [v for values in block_missing(rules).values() for v in values]
+    result["sniffing_off"] = [KIND_NAMES[k] for k in KINDS if result[k] and not result[k]["sniffing"]]
     result["udp443_expected"] = expected
     result["udp443_actual"] = actual
     result["udp443_ok"] = len(actual) == 1 and actual[0] == expected
     emit(result)
 
 
-def cmd_routing_apply(base, token, reality_tag, xhttp_tag):
+def add_block_rules(rules, missing):
+    changed = []
+    anchor = 0
+    for i, rule in enumerate(rules):
+        if rule.get("outboundTag") == "api" or any(plain_block(rule, f) for f in ("ip", "protocol", "domain")):
+            anchor = i + 1
+    for field in ("ip", "protocol", "domain"):
+        if not missing[field]:
+            continue
+        target = next((r for r in rules if plain_block(r, field)), None)
+        if target is None:
+            target = {"type": "field", field: [], "outboundTag": "blocked"}
+            rules.insert(anchor, target)
+            anchor += 1
+        target[field].extend(missing[field])
+        changed.append(target)
+    return changed
+
+
+def xray_test(config_path, xray_bin, rules):
+    assets = os.path.dirname(xray_bin)
+    for value in (str(v) for rule in rules for f in ("ip", "domain") for v in rule.get(f) or []):
+        if value.startswith("ext:"):
+            name = value.split(":")[1]
+            if not os.path.isfile(os.path.join(assets, name)):
+                raise Failure(f"нет файла {os.path.join(assets, name)} для {value}")
+    with open(config_path) as f:
+        config = json.load(f)
+    config.setdefault("routing", {}).setdefault("rules", [])[0:0] = rules
+    fd, path = tempfile.mkstemp(suffix=".json")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(config, f)
+        proc = subprocess.run([xray_bin, "run", "-test", "-c", path], capture_output=True, text=True,
+                              env=dict(os.environ, XRAY_LOCATION_ASSET=assets), timeout=60)
+    finally:
+        os.unlink(path)
+    if proc.returncode != 0:
+        lines = [line for line in (proc.stdout + proc.stderr).splitlines() if line.strip()]
+        raise Failure("xray -test: " + (lines[-1] if lines else f"код {proc.returncode}"))
+
+
+def cmd_routing_apply(base, token, reality_tag, xhttp_tag, config_path, xray_bin):
     api = Api(base, token)
     template = json.loads(api.call("panel/api/xray/", form={}))["xraySetting"]
     rules = template.setdefault("routing", {}).setdefault("rules", [])
     changes = []
-    if not any(is_ru_block(r) for r in rules):
-        rules.append({"type": "field", "ip": ["geoip:ru"], "outboundTag": "blocked"})
-        changes.append("добавлено geoip:ru → blocked")
+    missing = block_missing(rules)
+    changed = add_block_rules(rules, missing)
+    if changed:
+        xray_test(config_path, xray_bin, json.loads(json.dumps(changed)))
+        changes.append("blocked: добавлено " + ", ".join(v for values in missing.values() for v in values))
     tags = sorted({tag for tag in (reality_tag, xhttp_tag) if tag})
     old = [r for r in rules if is_udp443_block(r)]
     if len(old) != 1 or sorted(set(old[0].get("inboundTag") or [])) != tags:
@@ -1293,20 +1376,25 @@ def cmd_routing_apply(base, token, reality_tag, xhttp_tag):
 def cmd_routing_test(base, token, reality_tag, xhttp_tag):
     api = Api(base, token)
 
-    def blocked(tag, ip, network):
-        obj = api.call("panel/api/xray/routeTest",
-                       form={"inboundTag": tag, "ip": ip, "port": "443", "network": network})
+    def blocked(tag, network="tcp", **target):
+        form = {"inboundTag": tag, "port": "443", "network": network}
+        form.update(target)
+        obj = api.call("panel/api/xray/routeTest", form=form)
         return bool(obj and obj.get("matched") and obj.get("outboundTag") == "blocked")
 
     probe = "probe-" + "".join(c for c in reality_tag + xhttp_tag if c.isalnum())
     checks = {
-        "Reality UDP/443 блокируется": blocked(reality_tag, "8.8.8.8", "udp"),
-        "другой инбаунд UDP/443 не блокируется": not blocked(probe, "8.8.8.8", "udp"),
-        "TCP/443 не блокируется": not blocked(reality_tag, "8.8.8.8", "tcp"),
-        "geoip:ru блокируется": blocked(reality_tag, "77.88.8.8", "tcp"),
+        "Reality UDP/443 блокируется": blocked(reality_tag, "udp", ip="8.8.8.8"),
+        "другой инбаунд UDP/443 не блокируется": not blocked(probe, "udp", ip="8.8.8.8"),
+        "TCP/443 не блокируется": not blocked(reality_tag, ip="8.8.8.8"),
+        "geoip:private блокируется": blocked(reality_tag, ip="10.0.0.1"),
+        "RU IP блокируется": blocked(reality_tag, ip="77.88.8.8"),
+        "домен .ru блокируется": blocked(reality_tag, domain="test.ru"),
+        "example.com не блокируется": not blocked(reality_tag, domain="example.com"),
+        "bittorrent блокируется": blocked(reality_tag, ip="8.8.8.8", protocol="bittorrent"),
     }
     if xhttp_tag:
-        checks["XHTTP UDP/443 блокируется"] = blocked(xhttp_tag, "8.8.8.8", "udp")
+        checks["XHTTP UDP/443 блокируется"] = blocked(xhttp_tag, "udp", ip="8.8.8.8")
     failed = [name for name, ok in checks.items() if not ok]
     emit({"failed": failed})
     if failed:
@@ -3143,15 +3231,19 @@ check_routing() {
         mismatch "в config.json нет Reality$(xhttp_enabled && echo " или XHTTP")"
         return 1
     fi
-    [[ "$(json_get "$summary" ru_block)" == true ]] || {
-        mismatch "нет правила geoip:ru → blocked"
+    if [[ "$(json_get "$summary" block_missing)" != "[]" ]]; then
+        mismatch "нет в правилах blocked: $(block_missing_text "$summary")"
         rc=1
-    }
+    fi
     [[ "$(json_get "$summary" udp443_ok)" == true ]] || {
         mismatch "правило UDP/443 → blocked: $(json_get "$summary" udp443_actual), нужно $(json_get "$summary" udp443_expected)"
         rc=1
     }
     return "$rc"
+}
+
+block_missing_text() {
+    json_lines "$1" block_missing | paste -sd ' ' -
 }
 
 apply_routing() {
@@ -3160,7 +3252,7 @@ apply_routing() {
     reality=$(json_get "$summary" reality.tag)
     xhttp=$(json_get "$summary" xhttp.tag)
     token=$(api_token) || return 1
-    report=$(py routing-apply "$(api_base)" "$token" "$reality" "$xhttp") || {
+    report=$(py routing-apply "$(api_base)" "$token" "$reality" "$xhttp" "$XRAY_CONFIG" "$(xray_bin)") || {
         log "Не удалось изменить маршрутизацию: ${report}"
         return 1
     }
@@ -3313,6 +3405,16 @@ final_config_checks() {
         report_ok "config.json: ненулевых limitFallback нет"
     else
         report_fail "config.json: limitFallback $(json_get "$summary" reality.limit_fallback)"
+    fi
+    if [[ "$(json_get "$summary" sniffing_off)" == "[]" ]]; then
+        report_ok "config.json: sniffing http, tls, quic, routeOnly на всех инбаундах"
+    else
+        report_fail "config.json: sniffing не по шаблону: $(json_lines "$summary" sniffing_off | paste -sd ',' - | sed 's/,/, /g')"
+    fi
+    if [[ "$(json_get "$summary" block_missing)" == "[]" ]]; then
+        report_ok "правила blocked: geoip:private, IP RU, bittorrent, домены RU, реклама"
+    else
+        report_fail "нет в правилах blocked: $(block_missing_text "$summary")"
     fi
     if [[ "$(json_get "$summary" udp443_ok)" == true ]]; then
         report_ok "правило UDP/443 → blocked: $(json_get "$summary" udp443_expected)"

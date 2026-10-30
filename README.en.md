@@ -11,16 +11,16 @@
 
 ---
 
-The script deploys the 3x-ui panel on a VPS, VLESS Reality on 443/tcp disguised as its own website, optionally VLESS XHTTP and Hysteria2, and outputs a single subscription link for all protocols. It issues a Let's Encrypt certificate and configures nginx, routing and ufw. Supports a fresh install and importing `x-ui.db` from another server.
+The script installs the 3x-ui panel on a VPS and sets up VLESS Reality on 443/tcp. From the outside, the server looks like an ordinary website on your domain. VLESS XHTTP and Hysteria2 can be added as well. All protocols reach the client through a single subscription link. The script also takes care of the Let's Encrypt certificate, nginx, routing and ufw. You can install from scratch or move an `x-ui.db` database from another server.
 
 > The script's prompts and messages are in Russian.
 
 ## Requirements
 
-- Ubuntu, root or sudo.
+- Ubuntu, root or sudo access.
 - A domain or subdomain with an A record pointing to the server's IP.
 - Free ports 80/tcp and 443/tcp.
-- ufw is configured automatically. With another firewall, open: 80/tcp, 443/tcp, SSH, the Hysteria2 UDP port.
+- The script configures ufw itself. With a different firewall, open 80/tcp, 443/tcp, SSH and the Hysteria2 UDP port there.
 
 ## Installation
 
@@ -35,29 +35,29 @@ Answer the questions again:
 sudo bash install.sh --reconfigure
 ```
 
-Check without changing the server, exit code 0 — no errors, 1 — errors found. Paths in the answers file that differ from the 3x-ui database — warning, the check uses the database:
+Check the server without changing anything:
 
 ```bash
 sudo bash install.sh --check
 ```
 
-Removing components of choice:
+Remove what the script installed, fully or in parts:
 
 ```bash
 sudo bash install.sh --uninstall
 ```
 
-| Item | Removed |
+| Item | What is removed |
 |---|---|
-| 1 | 3x-ui: x-ui service, `/usr/local/x-ui`, `/etc/x-ui`, `/var/log/x-ui`, fail2ban jail `3x-ipl`. Database copy — `/root/x-ui.db.<date>`. |
+| 1 | 3x-ui: the x-ui service, `/usr/local/x-ui`, `/etc/x-ui`, `/var/log/x-ui`, fail2ban jail `3x-ipl`. The database is copied to `/root/x-ui.db.<date>` first. |
 | 2 | nginx configs created by the script: site, anti-scan, port 80. |
-| 3 | Certificate `/etc/ssl/<folder>`, the domain in acme.sh, `cert-renew.sh`, cron job. acme.sh is removed entirely if it holds no other domains. |
-| 4 | ufw rules with the script comment, except SSH. |
-| 5 | Items 1–4, decoy site, answers file, log, `/root/nginx-*.tgz` archives. |
+| 3 | Certificate `/etc/ssl/<folder>`, the domain in acme.sh, `cert-renew.sh` and the cron job. acme.sh itself is removed only if it holds no other domains. |
+| 4 | ufw rules added by the script. The SSH rule stays. |
+| 5 | Everything above, plus the decoy site, answers file, log and `/root/nginx-*.tgz` archives. |
 
-nginx and fail2ban packages — a separate question. curl, openssl, python3, sqlite3, cron are not removed. `/etc/nginx/snippets/xui-panel*.conf` files are not removed.
+The nginx and fail2ban packages are removed only if you confirm a separate question. curl, openssl, python3, sqlite3, cron and `/etc/nginx/snippets/xui-panel*.conf` files are not removed.
 
-Reinstalling 3x-ui: `--uninstall`, item 1, then `sudo bash install.sh`.
+To reinstall 3x-ui, remove item 1 and run `sudo bash install.sh`.
 
 ## Layout
 
@@ -78,93 +78,93 @@ Reinstalling 3x-ui: `--uninstall`, item 1, then `sudo bash install.sh`.
 <port>/udp     → Hysteria2 (optional)
 ```
 
-Ports open from outside: 80/tcp, 443/tcp, SSH, the Hysteria2 UDP port. All addresses in the links use the domain.
+Only 80/tcp, 443/tcp, SSH and the Hysteria2 UDP port are open from the outside. All links use the domain, not the IP.
 
-## Components
+## What gets configured
 
 | Component | Settings |
 |---|---|
-| Certificate | Let's Encrypt, acme.sh, ECDSA, HTTP-01 through nginx (webroot `/var/www/acme`). Renewal: `/usr/local/sbin/cert-renew.sh` from root's cron, daily, when fewer than 30 days remain. |
-| nginx | `127.0.0.1:7443`, TLS 1.3 + h2. Default server: `ssl_reject_handshake on`. Decoy website, XHTTP (`grpc_pass`), subscription and panel (`proxy_pass`, WebSocket) on secret paths. 80/tcp: 301 to https for the domain, 444 for other requests. |
-| 3x-ui | Panel on `127.0.0.1:2053`, accessed through nginx. Version: the one tested with the script; when a newer one is out, a choice is offered during installation. |
-| 3x-ui ads | Always blocked. nginx answers `/<panel path>/sponsors` with an empty list and `/<panel path>/sponsors/` with 404. The panel does not download the ad list or logos. |
+| Certificate | Let's Encrypt via acme.sh, ECDSA, HTTP-01 challenge through nginx (webroot `/var/www/acme`). Renewed by `/usr/local/sbin/cert-renew.sh`: cron runs it daily, and the certificate is renewed when less than 30 days are left. |
+| nginx | Listens on `127.0.0.1:7443`, TLS 1.3 and h2. Connections without SNI or with a foreign SNI are rejected (`ssl_reject_handshake`). XHTTP (`grpc_pass`), the subscription and the panel (`proxy_pass`, WebSocket) live on secret paths, everything else is the decoy site. On 80/tcp the domain is redirected to https, other requests get 444. |
+| 3x-ui | The panel listens on `127.0.0.1:2053` and is reachable only through nginx. The version tested with the script is installed. If a newer one is out, you can pick it during installation. |
+| 3x-ui ads | Always off: nginx returns an empty list for `/<panel path>/sponsors` and 404 for `/<panel path>/sponsors/`. |
 | VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI is the domain, xver 0. |
-| VLESS XHTTP | Optional. `127.0.0.1:8081`, `stream-one`, security none. Host `<domain>:443`, TLS, ALPN `h2`, fingerprint `firefox`. |
-| Hysteria2 | Optional. UDP, TLS with the domain certificate, ALPN `h3`, Salamander. Default port 443/udp. |
-| Routing | `geoip:ru` → blocked unless a blocked rule with `geoip:ru` or `ext:<file>:ru` exists; UDP/443 → blocked for Reality and XHTTP. Tags from `config.json`. |
-| Subscription | `127.0.0.1:2096`, `subURI` = `https://<domain>/<subscription path>/`. |
-| ufw | SSH (ports of the sshd and ssh.socket listening sockets), 80/tcp, 443/tcp, the Hysteria2 UDP port. |
+| VLESS XHTTP | Optional. `127.0.0.1:8081`, `stream-one` mode. In the subscription: `<domain>:443`, TLS, ALPN `h2`, fingerprint `firefox`. |
+| Hysteria2 | Optional. UDP, domain certificate, ALPN `h3`, Salamander. Default port 443/udp. |
+| Sniffing | On Reality, XHTTP and Hysteria2: `http`, `tls`, `quic`, `routeOnly`. The domain found in traffic is used for routing only, the destination address is not replaced. |
+| Routing | → blocked: private IPs (`geoip:private`), Russian IPs (`ext:geoip_RU.dat:ru`), BitTorrent, domains from `ext:geosite_RU.dat:ru-available-only-inside`, the `.ru`, `.su`, `.рф` zones, ads (`category-ads-all`); UDP/443 for Reality and XHTTP. Your own rules are kept, the script only adds what is missing. |
+| Subscription | `127.0.0.1:2096`, link format `https://<domain>/<subscription path>/`. |
+| ufw | SSH (the port is taken from the running sshd or ssh.socket), 80/tcp, 443/tcp, the Hysteria2 UDP port. |
 
-Custom directives for the panel location (e.g. `sub_filter`): `/etc/nginx/snippets/xui-panel*.conf`, included via `include`, the script never changes these files.
+Your own directives for the panel, such as `sub_filter` for a favicon, go into `/etc/nginx/snippets/xui-panel*.conf`. The script includes these files and never changes them.
 
-Custom decoy page: on first install the script pauses; you can put `index.html` and `favicon.ico` / `.svg` / `.png` into `/var/www/<domain>/`. Otherwise a 403 page is installed.
+Your own decoy site: on the first install the script pauses so you can put `index.html` and `favicon.ico`, `.svg` or `.png` into `/var/www/<domain>/`. Without them, a 403 page is installed.
 
-## Installation modes
-
-### Fresh install
+## Fresh install
 
 The script asks for:
 
-1. domain, email for Let's Encrypt;
-2. path to `x-ui.db` — leave empty;
-3. 3x-ui version — if a newer one than the tested version is out;
-4. VLESS XHTTP: yes/no;
-5. secret paths for XHTTP, the subscription, the panel;
+1. the domain and an email for Let's Encrypt;
+2. the path to `x-ui.db` — leave empty;
+3. the 3x-ui version, if a newer one than the tested version is out;
+4. whether to add VLESS XHTTP;
+5. secret paths for XHTTP, the subscription and the panel;
 6. panel username and password;
-7. Hysteria2: yes/no, port;
+7. whether to add Hysteria2 and on which port;
 8. the first client's name.
 
-Domain and email are required; everything else is generated if left empty.
+Only the domain and email are required, everything else is generated if left empty.
 
-A secret path is one or more parts separated by `/`, characters `A–Z`, `a–z`, `0–9`, `-`, `_`. Paths must differ and must not contain one another.
+A secret path is one or more parts separated by `/`, made of letters, digits, `-` and `_`. Paths must not match or be nested in each other.
 
-Hysteria2 port: 443 by default, `r` picks a random port in 20000–60000. Not accepted: 51820, 1194, 500, 4500, 1723; 1–1023 except 443; 7443, 8081, 2053, 2096, 62789; SSH; UDP ports in use.
+The Hysteria2 port is 443 by default, `r` picks a random one in 20000–60000. Not allowed: 51820, 1194, 500, 4500, 1723; 1–1023 except 443; 7443, 8081, 2053, 2096, 62789; the SSH port; UDP ports in use.
 
-### Importing x-ui.db
+## Moving x-ui.db
 
-1. On the source server:
+1. On the old server run:
    ```bash
    sqlite3 /etc/x-ui/x-ui.db "PRAGMA wal_checkpoint(TRUNCATE);"
    ```
-   copy `/etc/x-ui/x-ui.db` to the new server.
+   and copy `/etc/x-ui/x-ui.db` to the new server.
 2. Point the domain's A record to the new IP.
 3. Run the script and enter the path to the file.
 
-Clients, panel username and password, and secret paths are taken from the database. Changes:
+Clients, the panel username and password, and secret paths are taken from the database. During the move:
 
-- Reality: port 443, target `127.0.0.1:7443`, SNI is the domain, non-zero `limitFallback*` removed. x25519 keys and shortIds are kept if Reality is already in this layout, otherwise new ones. Several enabled Reality inbounds — the script stops and lists them.
+- Reality is moved to 443, target `127.0.0.1:7443`, SNI is the domain; non-zero `limitFallback*` are removed. x25519 keys and shortIds are kept if Reality was already set up the same way, otherwise new ones are issued. If several Reality inbounds are enabled, the script stops and lists them.
 - Other inbounds on public TCP ports are disabled.
-- VLESS XHTTP: if absent from the database, asks whether to add it.
-- Hysteria2: asks whether to keep the current port; if absent, asks whether to add it.
-- Hosts: address is the domain, ports are 443 (Reality, XHTTP) and the Hysteria2 port. Hosts with another domain are not changed.
-- `externalProxy` in inbounds is removed: links are built from Hosts.
+- If the database has no XHTTP or Hysteria2, the script offers to add them. For Hysteria2 it asks whether to keep the current port.
+- Hosts get the domain as the address, port 443 (Reality, XHTTP) and the Hysteria2 port. Hosts with another domain are left as they are.
+- `externalProxy` is removed: links are built from Hosts.
 - Tags in routing rules, `subURI` and ufw rules are updated.
-- Panel username and password: asks whether to set new ones; otherwise the existing ones are kept.
+- You can set a new panel username and password or keep the old ones.
 - 2FA is disabled.
 
-A database from a newer 3x-ui version than the installed one is not imported: the script stops before any change and lists the unknown migrations and tables.
+A database from a newer 3x-ui version than the installed one is not moved: the script stops before any change and lists the unknown migrations and tables.
 
 ## Checks
 
-After installation:
+At the end of installation and with `--check`, the script verifies that:
 
 - only Xray listens on 443/tcp, nginx on `127.0.0.1:7443` and 80/tcp, Hysteria2 on its UDP port;
-- `config.json`: Reality on 443, target `127.0.0.1:7443`, no non-zero `limitFallback`; the UDP/443 rule covers the Reality and XHTTP tags;
-- no connections to `127.0.0.1:443`;
-- `127.0.0.1:7443`: TLS 1.3, h2, domain certificate, rejection without SNI;
-- public 443: no SNI and a foreign SNI are rejected, the domain gets the certificate;
-- the site, panel and subscription respond through 443, the subscription contains all protocols;
-- the 3x-ui ad request is intercepted by nginx;
-- 80/tcp: by IP and with a foreign Host the connection is closed without a response, the domain gets a 301 to https, `/.well-known/acme-challenge/` is served;
-- acme.sh is in webroot mode, `cert-renew.sh` is in root's cron;
-- no warning in the Xray log about Reality not on 443;
+- in `config.json` Reality is on 443 with target `127.0.0.1:7443`, has no non-zero `limitFallback`, inbounds have sniffing, and the blocking and UDP/443 rules are in place;
+- there are no connections to `127.0.0.1:443`;
+- `127.0.0.1:7443` answers with TLS 1.3 and h2 using the domain certificate and rejects connections without SNI;
+- public 443 rejects connections without SNI or with a foreign SNI and serves the certificate for the domain;
+- the site, panel and subscription open through 443, and the subscription contains all protocols;
+- nginx intercepts the 3x-ui ad request;
+- on 80/tcp, requests by IP or with a foreign Host are closed without a response, the domain gets a 301 to https, `/.well-known/acme-challenge/` is served;
+- acme.sh works through webroot, `cert-renew.sh` is in root's cron;
+- the Xray log has no warning about Reality not being on 443;
 - ufw rules.
 
-Output: panel address, username, password, subscription link.
+If a path in the answers file differs from the 3x-ui database, `--check` shows a warning and checks against the database.
+
+At the end of installation, the panel address, username, password and subscription link are printed.
 
 ## Re-running
 
-Each step compares the current state with the target state and changes only what differs. On a configured server a run changes nothing; an interrupted installation is completed.
+Each step compares the current state with the desired one and fixes only the differences. On a configured server a re-run changes nothing, and an interrupted installation continues where it stopped.
 
 ## Files on the server
 
@@ -173,11 +173,11 @@ Each step compares the current state with the target state and changes only what
 | `/root/.xui-reality-selfsteal-443-installer.conf` | answers, panel username and password (0600) |
 | `/root/xui-reality-selfsteal-443-installer.log` | log (0600) |
 | `/etc/nginx/sites-available/<domain>` | site |
-| `/etc/nginx/conf.d/00-reject-unknown-sni.conf` | anti-scan 127.0.0.1:7443 |
-| `/etc/nginx/conf.d/00-http-reject.conf` | anti-scan 80/tcp |
-| `/etc/nginx/conf.d/10-http-<domain>.conf` | port 80 of the domain |
+| `/etc/nginx/conf.d/00-reject-unknown-sni.conf` | anti-scan for 127.0.0.1:7443 |
+| `/etc/nginx/conf.d/00-http-reject.conf` | anti-scan for 80/tcp |
+| `/etc/nginx/conf.d/10-http-<domain>.conf` | port 80 for the domain |
 | `/var/www/acme/` | HTTP-01 challenge directory |
-| `/var/www/<domain>/` | decoy page |
+| `/var/www/<domain>/` | decoy site |
 | `/etc/ssl/<domain>/` | certificate |
 | `/usr/local/sbin/cert-renew.sh` | certificate renewal |
 
