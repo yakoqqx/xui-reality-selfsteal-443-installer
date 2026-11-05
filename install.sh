@@ -31,7 +31,8 @@ HTTP_PORT=80
 NGINX_ADDR="127.0.0.1"
 NGINX_PORT=7443
 REALITY_TARGET="${NGINX_ADDR}:${NGINX_PORT}"
-XHTTP_PORT=8081
+XHTTP_DEFAULT_PORT=8081
+REMARK_TEMPLATE="{{HOST}}|📊{{TRAFFIC_LEFT}}|⏳{{DAYS_LEFT}}D"
 SUB_PORT=2096
 PANEL_PORT=2053
 XRAY_API_PORT=62789
@@ -39,7 +40,7 @@ HY2_DEFAULT_PORT=443
 HY2_RANDOM_MIN=20000
 HY2_RANDOM_MAX=60000
 HY2_FORBIDDEN_PORTS=(51820 1194 500 4500 1723)
-INTERNAL_PORTS=("$NGINX_PORT" "$XHTTP_PORT" "$PANEL_PORT" "$SUB_PORT" "$XRAY_API_PORT")
+INTERNAL_PORTS=("$NGINX_PORT" "$PANEL_PORT" "$SUB_PORT" "$XRAY_API_PORT")
 
 DOMAIN_RE='^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$'
 EMAIL_RE='^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'
@@ -48,7 +49,7 @@ PATH_RE='^/?[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*/?$'
 NAME_RE='^[A-Za-z0-9_-]+$'
 USERNAME_RE='^[A-Za-z0-9_.-]{3,32}$'
 
-CONF_KEYS=(DOMAIN CERT_FOLDER ACME_EMAIL XHTTP XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH
+CONF_KEYS=(INSTALL_MODE DOMAIN CERT_FOLDER ACME_EMAIL XHTTP XHTTP_PORT XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH
     XUI_CREDENTIALS_PENDING HY2 HY2_PORT CLIENT_NAME)
 declare -A CONF=()
 
@@ -402,7 +403,6 @@ import uuid
 # НАСТРОЙКИ
 
 REALITY_PORT = 443
-XHTTP_PORT = 8081
 XHTTP_LISTEN = "127.0.0.1"
 FINGERPRINT = "firefox"
 XHTTP_ALPN = ["h2"]
@@ -411,6 +411,7 @@ LOCAL_LISTENS = {"127.0.0.1", "::1", "localhost"}
 AUTO_TAG = re.compile(r"^(n\d+-)?in-\d+-(tcp|udp|tcpudp|any)(-\d+)?$")
 KINDS = ("reality", "xhttp", "hy2")
 KIND_NAMES = {"reality": "VLESS Reality", "xhttp": "VLESS XHTTP", "hy2": "Hysteria2"}
+REMARKS = {"reality": "VLESS-TCP", "xhttp": "VLESS-XHTTP", "hy2": "HYSTERIA2"}
 SETTING_DEFAULTS = {"subEnable": "true", "subPort": "2096", "webPort": "2053"}
 INBOUND_FIELDS = ["id", "protocol", "port", "tag", "enable", "listen", "settings",
                   "stream_settings", "sniffing", "remark", "node_id", "origin_node_guid"]
@@ -590,6 +591,7 @@ def cmd_discover(db):
         "sub_path": values.get("subPath", ""),
         "web_base_path": values.get("webBasePath", ""),
         "hy2_port": hy2[0]["port"] if len(hy2) == 1 else "",
+        "xhttp_port": xhttp[0]["port"] if len(xhttp) == 1 else "",
         "has_clients": any(clients_of(ib) for ib in own_active(inbounds)),
         "sub_id": sub_id,
         "ports": sorted({f"{ib['port']}/{ib['transport']}" for ib in inbounds if ib["own"] and ib["port"]}),
@@ -638,6 +640,7 @@ def cmd_import_prepare(db, xray_bin, domain, target):
             kept.append(ib["tag"])
             continue
         private, public = x25519(xray_bin)
+        rs["serverNames"] = [domain]
         rs["privateKey"] = private
         inner = rs.get("settings") if isinstance(rs.get("settings"), dict) else {}
         inner["publicKey"] = public
@@ -674,6 +677,10 @@ def limit_fallback_active(rs):
     return active
 
 
+def tag_suffixed(tag):
+    return bool(re.match(r"^in-\d+-(tcp|udp|tcpudp|any)-\d+$", tag or ""))
+
+
 def sniffing_ok(sniffing):
     if not isinstance(sniffing, dict):
         return False
@@ -702,9 +709,10 @@ def normalize_reality(ib, domain, target):
         rs["target"] = target
         if "dest" in rs:
             rs["dest"] = target
-    if rs.get("serverNames") != [domain]:
-        notes.append(f"serverNames {rs.get('serverNames') or []} → [{domain}]")
-        rs["serverNames"] = [domain]
+    names = rs.get("serverNames") if isinstance(rs.get("serverNames"), list) else []
+    if domain not in names:
+        notes.append(f"serverNames {names} → {[domain] + names}")
+        rs["serverNames"] = [domain] + names
     inner = rs.get("settings")
     if isinstance(inner, dict) and inner.get("serverName") not in (None, "", domain):
         notes.append(f"settings.serverName {inner['serverName']} → {domain}")
@@ -726,7 +734,7 @@ def normalize_reality(ib, domain, target):
     return stream, fields, notes
 
 
-def normalize_xhttp(ib, domain, path):
+def normalize_xhttp(ib, domain, path, port):
     stream = json.loads(json.dumps(ib["stream"]))
     notes, fields = [], {}
     xs = stream.get("xhttpSettings")
@@ -748,9 +756,9 @@ def normalize_xhttp(ib, domain, path):
     if (ib["listen"] or "").strip() != XHTTP_LISTEN:
         notes.append(f"listen {ib['listen'] or '<пусто>'} → {XHTTP_LISTEN}")
         fields["listen"] = XHTTP_LISTEN
-    if ib["port"] != XHTTP_PORT:
-        notes.append(f"порт {ib['port']} → {XHTTP_PORT}")
-        fields["port"] = XHTTP_PORT
+    if ib["port"] != port:
+        notes.append(f"порт {ib['port']} → {port}")
+        fields["port"] = port
     normalize_sniffing(ib, notes, fields)
     return stream, fields, notes
 
@@ -848,8 +856,9 @@ def write_inbound(cur, ib_id, stream, fields):
         cur.execute(f"UPDATE inbounds SET {', '.join(assignments)} WHERE id=?", (*values, ib_id))
 
 
-def cmd_inbounds(mode, db, domain, cert_folder, xhttp_path, hy2_port, target):
+def cmd_inbounds(mode, db, domain, cert_folder, xhttp_path, hy2_port, target, xhttp_port):
     hy2_port = as_int(hy2_port)
+    xhttp_port = as_int(xhttp_port)
     conn, cur = open_db(db)
     inbounds = read_inbounds(cur)
     report = {"fatal": [], "problems": [], "warnings": [], "changes": [], "missing": [],
@@ -887,12 +896,16 @@ def cmd_inbounds(mode, db, domain, cert_folder, xhttp_path, hy2_port, target):
             plans.append(("port", ib, None, port_fields, [f"порт {ib['port']} → {REALITY_PORT}"]))
     if "xhttp" in selected and xhttp_path:
         ib = selected["xhttp"]
-        stream, fields, notes = normalize_xhttp(ib, domain, xhttp_path)
+        stream, fields, notes = normalize_xhttp(ib, domain, xhttp_path, xhttp_port)
         plans.append(("main", ib, stream, fields, notes))
     if "hy2" in selected and hy2_port:
         ib = selected["hy2"]
         stream, fields, notes = normalize_hy2(ib, domain, cert_folder, hy2_port)
         plans.append(("main", ib, stream, fields, notes))
+    for kind, ib in selected.items():
+        if tag_suffixed(ib["tag"]):
+            report["warnings"].append(f"{KIND_NAMES[kind]} ({describe(ib)}): тег с суффиксом — если сервер станет "
+                                      "узлом мастер-панели 3x-ui, синхронизация не найдёт этот инбаунд")
     chosen = {ib["id"] for ib in selected.values()}
     for ib in own_active(inbounds):
         if ib["id"] in chosen:
@@ -945,14 +958,16 @@ def host_rows(cur):
 
 def desired_host(kind, domain, hy2_port):
     if kind == "reality":
-        return {"address": domain, "port": REALITY_PORT, "security": "same", "sni": "",
+        return {"address": domain, "port": REALITY_PORT, "security": "same", "sni": domain,
                 "override_sni_from_address": 0}
     if kind == "xhttp":
         return {"address": domain, "port": REALITY_PORT, "security": "tls", "fingerprint": FINGERPRINT, "alpn": XHTTP_ALPN}
     return {"address": domain, "port": hy2_port, "security": "same"}
 
 
-def same_value(key, current, wanted):
+def same_value(key, current, wanted, single_name=True):
+    if key == "sni" and single_name and (current or "") == "":
+        return True
     if key == "override_sni_from_address":
         return enabled(current) == bool(wanted) if current not in (None, "") else not wanted
     if key == "port":
@@ -973,7 +988,7 @@ def cmd_hosts(mode, db, domain, hy2_port):
     conn, cur = open_db(db)
     inbounds = read_inbounds(cur)
     rows, present = host_rows(cur)
-    report = {"problems": [], "changes": [], "missing": [], "foreign": [], "fixable": 0}
+    report = {"problems": [], "changes": [], "missing": [], "fixable": 0}
     if rows is None:
         report["problems"].append("в базе нет таблицы hosts")
         conn.close()
@@ -985,20 +1000,19 @@ def cmd_hosts(mode, db, domain, hy2_port):
             continue
         ib = found[0]
         wanted = desired_host(kind, domain, hy2_port)
+        single_name = len((ib["stream"].get("realitySettings") or {}).get("serverNames") or []) <= 1
         own_hosts = []
         for host in rows:
             if host["inbound_id"] != ib["id"]:
                 continue
             if own_address(host["address"], domain):
                 own_hosts.append(host)
-            else:
-                report["foreign"].append(f"{KIND_NAMES[kind]}: Хост {host['address']}:{host['port']} оставлен без изменений")
         if not own_hosts:
-            report["missing"].append({"kind": kind, "inbound_id": ib["id"], **wanted})
+            report["missing"].append({"kind": kind, "inbound_id": ib["id"], "remark": REMARKS[kind], **wanted})
             report["problems"].append(f"{KIND_NAMES[kind]}: нет Хоста {domain}:{wanted['port']}")
             continue
         for host in own_hosts:
-            diffs = {k: v for k, v in wanted.items() if k in present and not same_value(k, host.get(k), v)}
+            diffs = {k: v for k, v in wanted.items() if k in present and not same_value(k, host.get(k), v, single_name)}
             if not diffs:
                 continue
             text = ", ".join(f"{k} {host_value(k, host.get(k))} → {host_value(k, v)}" for k, v in diffs.items())
@@ -1138,7 +1152,7 @@ def cloned_clients(source, kind, records):
 def reality_inbound(p, clients, xray_bin):
     private, public = x25519(xray_bin)
     return {
-        "remark": "Reality-VLESS", "listen": "", "port": REALITY_PORT, "protocol": "vless",
+        "remark": REMARKS["reality"], "listen": "", "port": REALITY_PORT, "protocol": "vless",
         "settings": {"clients": clients, "decryption": "none", "fallbacks": []},
         "streamSettings": {
             "network": "tcp", "security": "reality",
@@ -1153,7 +1167,7 @@ def reality_inbound(p, clients, xray_bin):
 
 def xhttp_inbound(p, clients):
     return {
-        "remark": "XHTTP-VLESS", "listen": XHTTP_LISTEN, "port": XHTTP_PORT, "protocol": "vless",
+        "remark": REMARKS["xhttp"], "listen": XHTTP_LISTEN, "port": p["xhttp_port"], "protocol": "vless",
         "settings": {"clients": clients, "decryption": "none", "fallbacks": []},
         "streamSettings": {
             "network": "xhttp", "security": "none",
@@ -1164,7 +1178,7 @@ def xhttp_inbound(p, clients):
 
 def hy2_inbound(p, clients):
     return {
-        "remark": "Hysteria2", "listen": "", "port": p["hy2_port"], "protocol": "hysteria",
+        "remark": REMARKS["hy2"], "listen": "", "port": p["hy2_port"], "protocol": "hysteria",
         "settings": {"clients": clients},
         "streamSettings": {
             "network": "hysteria", "security": "tls",
@@ -1185,9 +1199,10 @@ def hy2_inbound(p, clients):
     }
 
 
-def cmd_create_missing(base, token, db, xray_bin, domain, cert_folder, xhttp_path, hy2_port, target, client_name):
+def cmd_create_missing(base, token, db, xray_bin, domain, cert_folder, xhttp_path, hy2_port, target, client_name,
+                       xhttp_port):
     p = {"domain": domain, "cert_folder": cert_folder, "xhttp_path": xhttp_path,
-         "hy2_port": as_int(hy2_port), "target": target}
+         "hy2_port": as_int(hy2_port), "target": target, "xhttp_port": as_int(xhttp_port)}
     conn, cur = open_db(db)
     inbounds = read_inbounds(cur)
     records = client_records(cur)
@@ -1244,8 +1259,10 @@ def cmd_hosts_add(base, token, missing_json):
     api = Api(base, token)
     added = []
     for item in json.loads(missing_json):
-        body = {"inboundIds": [item["inbound_id"]], "hosts": [item["address"]], "remark": "main",
+        body = {"inboundIds": [item["inbound_id"]], "hosts": [item["address"]], "remark": item.get("remark") or "main",
                 "port": item["port"], "security": item["security"]}
+        if item.get("sni"):
+            body["sni"] = item["sni"]
         if item.get("fingerprint"):
             body["fingerprint"] = item["fingerprint"]
         if item.get("alpn"):
@@ -1740,6 +1757,28 @@ xhttp_enabled() {
     [[ "$(conf_get XHTTP)" != no ]]
 }
 
+recommended() {
+    [[ "$(conf_get INSTALL_MODE)" == recommended ]]
+}
+
+xhttp_port() {
+    local port
+    port=$(conf_get XHTTP_PORT)
+    printf '%s' "${port:-$XHTTP_DEFAULT_PORT}"
+}
+
+site_names() {
+    awk '$1 == "server_name" {for (i = 2; i <= NF; i++) {gsub(/;/, "", $i); if ($i != "") print $i}}' "$1" 2> /dev/null
+}
+
+other_domain_site() {
+    local names
+    names=$(site_names "$1")
+    [[ -n "$names" ]] || return 1
+    grep -qE '^[[:space:]]*listen[^;]*default_server' "$1" && return 1
+    ! grep -qxF -e "$(conf_get DOMAIN)" -e "_" <<< "$names"
+}
+
 xhttp_path_answer() {
     xhttp_enabled || return 0
     conf_get XHTTP_PATH
@@ -1794,9 +1833,40 @@ resolve_answer() {
     conf_set "$key" "$value"
 }
 
+resolve_install_mode() {
+    local choice
+    if [[ "$RECONFIGURE" -eq 1 ]]; then
+        [[ "$(conf_get INSTALL_MODE)" == manual ]] || conf_set INSTALL_MODE manual
+        return 0
+    fi
+    [[ -n "$(conf_get INSTALL_MODE)" || -n "$(conf_get DOMAIN)" ]] && return 0
+    xui_has_config && return 0
+    echo "Вариант установки:"
+    echo "  1  Стандартная — только VLESS Reality на 443, нужны домен и email,"
+    echo "     остальные параметры заполняются автоматически"
+    echo "  2  Расширенная — дополнительно XHTTP и Hysteria2, свои пути, логин и пароль панели,"
+    echo "     перенос базы x-ui.db"
+    while true; do
+        prompted
+        read -r -p "Выбор (Enter — 1): " choice || die "Ввод прерван."
+        case "${choice:-1}" in
+            1)
+                conf_set INSTALL_MODE recommended
+                return 0
+                ;;
+            2)
+                conf_set INSTALL_MODE manual
+                return 0
+                ;;
+        esac
+        echo "  Ожидается 1 или 2."
+    done
+}
+
 resolve_base_answers() {
     resolve_answer DOMAIN "Домен сервера (например srv1.example.com)" "$(discover_domain)" \
         "$DOMAIN_RE" "Некорректный домен. Пример: srv1.example.com"
+    recommended && [[ -z "$(conf_get CERT_FOLDER)" ]] && conf_set CERT_FOLDER "$(conf_get DOMAIN)"
     resolve_answer CERT_FOLDER "Папка сертификата в /etc/ssl/" "$(conf_get DOMAIN)" \
         "$FOLDER_RE" "Только буквы, цифры, точка, дефис, подчёркивание."
     resolve_answer ACME_EMAIL "Email для Let's Encrypt" "$(discover_email)" \
@@ -1806,6 +1876,7 @@ resolve_base_answers() {
 resolve_import() {
     local path reason
     IMPORT_DB=""
+    recommended && return 0
     if xui_has_config && [[ "$RECONFIGURE" -eq 0 ]]; then
         return 0
     fi
@@ -1845,6 +1916,10 @@ resolve_path() {
         fi
     fi
     [[ -n "$current" && "$RECONFIGURE" -eq 0 ]] && return 0
+    if recommended && [[ -z "$current" ]]; then
+        conf_set "$key" "/$(random_string 'a-z0-9' 14)"
+        return 0
+    fi
     while true; do
         if [[ -n "$current" ]]; then
             ask_optional value "${prompt} (Enter — оставить текущий)"
@@ -1883,12 +1958,61 @@ resolve_xhttp() {
         return 0
     fi
     [[ -n "$(conf_get XHTTP)" && "$RECONFIGURE" -eq 0 ]] && return 0
+    if recommended; then
+        conf_set XHTTP no
+        return 0
+    fi
     if ask_yes_no "Добавить VLESS XHTTP?" y; then
         conf_set XHTTP yes
     else
         conf_set XHTTP no
         conf_unset XHTTP_PATH
     fi
+}
+
+xhttp_port_invalid() {
+    local port="$1" p
+    if [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || ((10#$port < 1024 || 10#$port > 65535)); then
+        echo "допустимо 1024–65535"
+        return 0
+    fi
+    port=$((10#$port))
+    for p in "${INTERNAL_PORTS[@]}" "$HTTP_PORT" "$PUBLIC_TLS_PORT" $(ssh_ports); do
+        if ((port == p)); then
+            echo "порт ${port} занят службой сервера"
+            return 0
+        fi
+    done
+    if ! tcp_port_free "$port"; then
+        echo "TCP/${port} уже занят"
+        return 0
+    fi
+    return 1
+}
+
+resolve_xhttp_port() {
+    local current value reason
+    xhttp_enabled || return 0
+    current=$(json_get "$(xui_discover)" xhttp_port)
+    if [[ -n "$current" ]]; then
+        [[ "$(conf_get XHTTP_PORT)" == "$current" ]] || conf_set XHTTP_PORT "$current"
+        return 0
+    fi
+    [[ -n "$(conf_get XHTTP_PORT)" && "$RECONFIGURE" -eq 0 ]] && return 0
+    if recommended; then
+        conf_set XHTTP_PORT "$XHTTP_DEFAULT_PORT"
+        return 0
+    fi
+    while true; do
+        ask_optional value "Внутренний порт XHTTP (Enter — $(xhttp_port), допустимо 1024–65535)"
+        value="${value:-$(xhttp_port)}"
+        if reason=$(xhttp_port_invalid "$value"); then
+            echo "  Не подходит: ${reason}."
+            continue
+        fi
+        conf_set XHTTP_PORT "$((10#$value))"
+        return 0
+    done
 }
 
 resolve_paths() {
@@ -1927,6 +2051,13 @@ resolve_credentials() {
         [[ -n "$(conf_get XUI_USERNAME)" ]] && return 0
         xui_has_config && return 0
     fi
+    if recommended; then
+        conf_set XUI_USERNAME "admin$(random_string 'a-z0-9' 6)"
+        conf_set XUI_PASSWORD "$(random_string 'A-Za-z0-9' 16)"
+        conf_unset XUI_PASSWORD_HASH
+        conf_set XUI_CREDENTIALS_PENDING yes
+        return 0
+    fi
     ask_optional username "Логин панели (Enter — случайный)"
     [[ -z "$username" ]] && username="admin$(random_string 'a-z0-9' 6)"
     [[ "$username" =~ $USERNAME_RE ]] || die "Логин: 3–32 символа (буквы, цифры, точка, дефис, подчёркивание)."
@@ -1960,7 +2091,7 @@ hy2_port_invalid() {
         echo "порты 1–1023 запрещены, кроме 443"
         return 0
     fi
-    for p in "${INTERNAL_PORTS[@]}" $(ssh_ports); do
+    for p in "${INTERNAL_PORTS[@]}" "$(xhttp_port)" $(ssh_ports); do
         if ((port == p)); then
             echo "порт ${port} занят службой сервера"
             return 0
@@ -2029,6 +2160,11 @@ resolve_hy2() {
         conf_set HY2_PORT "$port"
         return 0
     fi
+    if recommended; then
+        conf_set HY2 no
+        conf_unset HY2_PORT
+        return 0
+    fi
     if ask_yes_no "Добавить Hysteria2 (UDP)?" y; then
         ask_hy2_port port ""
         conf_set HY2 yes
@@ -2043,6 +2179,10 @@ resolve_client_name() {
     local name
     [[ "$(json_get "$(xui_discover)" has_clients)" == true ]] && return 0
     [[ -n "$(conf_get CLIENT_NAME)" && "$RECONFIGURE" -eq 0 ]] && return 0
+    if recommended; then
+        conf_set CLIENT_NAME client1
+        return 0
+    fi
     name=$(conf_get CLIENT_NAME)
     ask name "Имя первого клиента" "${name:-client1}" "$NAME_RE" "Разрешены буквы, цифры, дефис и подчёркивание."
     conf_set CLIENT_NAME "$name"
@@ -2423,6 +2563,7 @@ resolve_xui_version() {
         return 0
     fi
     version_ge "${XUI_SUPPORTED_VERSION#v}" "${latest#v}" && return 0
+    recommended && return 0
     if [[ ! -t 0 ]]; then
         log_quiet "Последняя версия 3x-ui ${latest}, ввод не с терминала, выбрана ${XUI_SUPPORTED_VERSION}."
         return 0
@@ -2498,12 +2639,12 @@ import_db() {
     rm -f "${XUI_DB}-wal" "${XUI_DB}-shm"
     rm -rf "$work"
     [[ "$(json_get "$report" twofa_reset)" == true ]] && TWO_FA_RESET=1
-    conf_unset XHTTP XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH XUI_CREDENTIALS_PENDING \
+    conf_unset XHTTP XHTTP_PORT XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH XUI_CREDENTIALS_PENDING \
         HY2 HY2_PORT CLIENT_NAME
     IMPORTED_NOW=1
     log "База перенесена из ${src}"
-    [[ "$(json_get "$report" kept)" != "[]" ]] && log "Ключи Reality сохранены: $(json_get "$report" kept)."
-    [[ "$(json_get "$report" rekeyed)" != "[]" ]] && log "Ключи Reality выпущены заново: $(json_get "$report" rekeyed)."
+    [[ "$(json_get "$report" kept)" != "[]" ]] && log "Ключи Reality сохранены: $(json_get "$report" kept)"
+    [[ "$(json_get "$report" rekeyed)" != "[]" ]] && log "Ключи Reality выпущены заново: $(json_get "$report" rekeyed)"
     [[ "$TWO_FA_RESET" -eq 1 ]] && log "2FA из базы отключена"
     xui_start
 }
@@ -2561,7 +2702,7 @@ render_nginx_reject() {
 render_nginx_xhttp_location() {
     cat << EOF
     location $(conf_get XHTTP_PATH) {
-        grpc_pass            grpc://127.0.0.1:${XHTTP_PORT};
+        grpc_pass            grpc://127.0.0.1:$(xhttp_port);
         grpc_set_header      Host              \$host;
         grpc_set_header      X-Real-IP         \$remote_addr;
         grpc_set_header      X-Forwarded-For   \$proxy_add_x_forwarded_for;
@@ -2649,6 +2790,7 @@ nginx_foreign_listeners() {
         real=$(readlink -f "$f")
         [[ " $* " == *" ${real} "* ]] && continue
         [[ "$f" == "${NGINX_SITES_ENABLED}/default" ]] && continue
+        [[ "$port" == "$HTTP_PORT" ]] && other_domain_site "$f" && continue
         if grep -E '^[[:space:]]*listen[[:space:]]' "$f" | grep -vE '127\.0\.0\.1|\[::1\]' \
             | grep -qE "[[:space:]:]${port}([[:space:];]|$)"; then
             printf '%s\n' "$f"
@@ -2695,7 +2837,7 @@ prepare_stub_site() {
     dir=$(www_dir)
     stub_ready && return 0
     mkdir -p "$dir"
-    if [[ ! -s "${dir}/index.html" ]]; then
+    if [[ ! -s "${dir}/index.html" ]] && ! recommended; then
         echo "${INDENT}Папка сайта-заглушки: ${dir}"
         echo "${INDENT}Можно положить туда index.html и фавиконку (favicon.ico, .svg или .png)."
         prompted
@@ -2967,6 +3109,10 @@ apply_panel() {
         xui_start
         return 1
     fi
+    if fresh_xui_token && ! py settings-set "$XUI_DB" "remarkTemplate=${REMARK_TEMPLATE}"; then
+        xui_start
+        return 1
+    fi
     rm -f "$XUI_INSTALL_RESULT"
     if [[ -n "$(conf_get XUI_CREDENTIALS_PENDING)" ]]; then
         conf_set XUI_PASSWORD_HASH "$(py panel-user "$XUI_DB" password)"
@@ -3016,7 +3162,7 @@ apply_subscription() {
 
 inbounds_report() {
     py inbounds "$1" "$XUI_DB" "$(conf_get DOMAIN)" "$(conf_get CERT_FOLDER)" "$(xhttp_path_answer)" \
-        "$(hy2_port_answer)" "$REALITY_TARGET"
+        "$(hy2_port_answer)" "$REALITY_TARGET" "$(xhttp_port)"
 }
 
 runtime_inbounds_ok() {
@@ -3039,8 +3185,8 @@ runtime_inbounds_ok() {
         [[ "$quiet" -eq 1 ]] || mismatch "Xray не слушает ${PUBLIC_TLS_PORT}/tcp"
         rc=1
     }
-    if xhttp_enabled && ! tcp_listening "$NGINX_ADDR" "$XHTTP_PORT"; then
-        [[ "$quiet" -eq 1 ]] || mismatch "XHTTP не слушает ${NGINX_ADDR}:${XHTTP_PORT}"
+    if xhttp_enabled && ! tcp_listening "$NGINX_ADDR" "$(xhttp_port)"; then
+        [[ "$quiet" -eq 1 ]] || mismatch "XHTTP не слушает ${NGINX_ADDR}:$(xhttp_port)"
         rc=1
     fi
     if [[ "$hy2_port" != 0 ]]; then
@@ -3127,7 +3273,7 @@ create_missing_inbounds() {
     token=$(api_token) || return 1
     if ! report=$(py create-missing "$(api_base)" "$token" "$XUI_DB" "$(xray_bin)" "$(conf_get DOMAIN)" \
         "$(conf_get CERT_FOLDER)" "$(xhttp_path_answer)" "$(hy2_port_answer)" "$REALITY_TARGET" \
-        "$(conf_get CLIENT_NAME)"); then
+        "$(conf_get CLIENT_NAME)" "$(xhttp_port)"); then
         log "Не удалось создать инбаунды: ${report}"
         return 1
     fi
@@ -3177,7 +3323,6 @@ check_hosts() {
         mismatch "$line"
         rc=1
     done < <(json_lines "$report" problems)
-    json_lines "$report" foreign | warn_lines
     report=$(inbounds_report plan)
     if [[ -n "$(json_lines "$report" problems)" ]]; then
         mismatch "инбаунды изменились после записи Хостов"
@@ -3294,7 +3439,7 @@ ufw_allows() {
 ufw_stale_rules() {
     local spec comment port targets known
     targets=" $(ufw_target_rules | tr '\n' ' ') "
-    known=" ${INTERNAL_PORTS[*]} $(json_get "$(xui_discover)" ports | tr -d '[]",' ) ${STALE_PORTS} "
+    known=" ${INTERNAL_PORTS[*]} $(xhttp_port) $(json_get "$(xui_discover)" ports | tr -d '[]",' ) ${STALE_PORTS} "
     while IFS='|' read -r spec comment; do
         [[ -n "$spec" ]] || continue
         [[ "$targets" == *" ${spec} "* ]] && continue
@@ -3303,7 +3448,7 @@ ufw_stale_rules() {
             continue
         fi
         if [[ "$comment" == *"$SCRIPT_NAME"* || "$comment" == *acme* ]] \
-            || [[ " ${INTERNAL_PORTS[*]} " == *" ${port} "* ]] \
+            || [[ " ${INTERNAL_PORTS[*]} $(xhttp_port) " == *" ${port} "* ]] \
             || [[ "$known" == *" ${spec} "* || "$known" == *" ${port}/"* ]]; then
             printf '%s\n' "$spec"
         fi
@@ -3718,7 +3863,7 @@ uninstall_xui() {
     if ((f2b)) && systemctl is-active --quiet fail2ban; then
         systemctl restart fail2ban > /dev/null 2>&1
     fi
-    conf_unset XHTTP XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH \
+    conf_unset XHTTP XHTTP_PORT XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH \
         XUI_CREDENTIALS_PENDING HY2 HY2_PORT CLIENT_NAME
 }
 
@@ -3941,6 +4086,10 @@ print_summary() {
     log "Пароль:    $(panel_password_text)"
     log "Подписка:  https://$(conf_get DOMAIN)$(conf_get SUB_PATH)/$(json_get "$(xui_discover)" sub_id)"
     [[ "$TWO_FA_RESET" -eq 1 ]] && log "2FA:       отключена при импорте"
+    if grep -qF '<title>403 Forbidden</title>' "$(www_dir)/index.html" 2> /dev/null; then
+        log ""
+        log "Сейчас на сайте страница 403. Свою заглушку — index.html и фавиконку — можно положить в $(www_dir)/"
+    fi
     return 0
 }
 
@@ -3974,6 +4123,8 @@ check_resolve_answers() {
     if [[ -z "$(conf_get XHTTP)" ]]; then
         CONF[XHTTP]=$([[ -n "$(conf_get XHTTP_PATH)" ]] && echo yes || echo no)
     fi
+    value=$(json_get "$discovered" xhttp_port)
+    [[ -n "$value" ]] && CONF[XHTTP_PORT]="$value"
     if [[ -z "$(conf_get HY2)" ]]; then
         hy2_port=$(json_get "$discovered" hy2_port)
         if [[ -n "$hy2_port" ]]; then
@@ -4051,6 +4202,7 @@ main() {
     load_py_helper
     conf_load
 
+    resolve_install_mode
     resolve_base_answers
     converge "nginx: порт 80" http
     converge "Сертификат" cert
@@ -4058,6 +4210,7 @@ main() {
     resolve_xui_version
     converge "3x-ui" xui
     resolve_xhttp
+    resolve_xhttp_port
     resolve_paths
     resolve_credentials
     converge "nginx" nginx
