@@ -36,10 +36,8 @@ REMARK_TEMPLATE="{{HOST}}|📊{{TRAFFIC_LEFT}}|⏳{{DAYS_LEFT}}D"
 SUB_PORT=2096
 PANEL_PORT=2053
 XRAY_API_PORT=62789
-HY2_DEFAULT_PORT=443
-HY2_RANDOM_MIN=20000
-HY2_RANDOM_MAX=60000
-HY2_FORBIDDEN_PORTS=(51820 1194 500 4500 1723)
+HY2_PORT=443
+ALT_SVC_LINE="    add_header Alt-Svc 'h3=\":${HY2_PORT}\"; ma=86400' always;"
 INTERNAL_PORTS=("$NGINX_PORT" "$PANEL_PORT" "$SUB_PORT" "$XRAY_API_PORT")
 
 DOMAIN_RE='^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$'
@@ -49,8 +47,8 @@ PATH_RE='^/?[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*/?$'
 NAME_RE='^[A-Za-z0-9_-]+$'
 USERNAME_RE='^[A-Za-z0-9_.-]{3,32}$'
 
-CONF_KEYS=(INSTALL_MODE DOMAIN CERT_FOLDER ACME_EMAIL XHTTP XHTTP_PORT XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH
-    XUI_CREDENTIALS_PENDING HY2 HY2_PORT CLIENT_NAME)
+CONF_KEYS=(LANGUAGE INSTALL_MODE DOMAIN CERT_FOLDER ACME_EMAIL XHTTP XHTTP_PORT XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH
+    XUI_CREDENTIALS_PENDING HY2 CLIENT_NAME)
 declare -A CONF=()
 
 RECONFIGURE=0
@@ -72,8 +70,17 @@ STEP_NO=0
 STEP_TOTAL=0
 IN_STEP=0
 LAST_BLANK=1
+UI_LANG=ru
 
 # ОБЩИЕ ФУНКЦИИ
+
+L() {
+    if [[ "$UI_LANG" == en ]]; then
+        printf '%s' "$2"
+    else
+        printf '%s' "$1"
+    fi
+}
 
 emit() {
     printf '%s\n' "$1"
@@ -145,9 +152,9 @@ warn_lines() {
 template_differs() {
     local what="$1" file="$2"
     if [[ ! -e "$file" ]]; then
-        mismatch "${what} ${file} отсутствует"
+        mismatch "$(L "${what} ${file} отсутствует" "${what} ${file} is missing")"
     else
-        mismatch_minor "${what} ${file} отличается от шаблона"
+        mismatch_minor "$(L "${what} ${file} отличается от шаблона" "${what} ${file} differs from the template")"
     fi
 }
 
@@ -173,7 +180,7 @@ die() {
     fi
     IN_STEP=0
     emit ""
-    emit "Остановлено. Журнал: ${LOG_FILE}"
+    emit "$(L "Остановлено. Журнал: ${LOG_FILE}" "Stopped. Log: ${LOG_FILE}")"
     exit 1
 }
 
@@ -207,10 +214,21 @@ version_ge() {
 # ПАРАМЕТРЫ ЗАПУСКА
 
 print_usage() {
+    if [[ "$UI_LANG" == en ]]; then
+        cat << EOF
+Usage: sudo bash ${0##*/} [--reconfigure | --check | --uninstall]
+
+  --reconfigure  answer the questions again (language, domain, email, XHTTP, paths, panel login, Hysteria2)
+  --check        check only, no changes; exit code 0 — no errors, 1 — errors found,
+                 2 — the check cannot be performed
+  --uninstall    remove components of choice: 3x-ui, nginx, certificate, ufw rules, everything
+EOF
+        return
+    fi
     cat << EOF
 Использование: sudo bash ${0##*/} [--reconfigure | --check | --uninstall]
 
-  --reconfigure  задать вопросы заново (домен, email, XHTTP, пути, логин панели, Hysteria2)
+  --reconfigure  задать вопросы заново (язык, домен, email, XHTTP, пути, логин панели, Hysteria2)
   --check        только проверка, без изменений; код выхода 0 — ошибок нет, 1 — есть ошибки,
                  2 — проверку выполнить невозможно
   --uninstall    удаление компонентов на выбор: 3x-ui, nginx, сертификат, правила ufw, всё
@@ -228,7 +246,7 @@ parse_args() {
                 exit 0
                 ;;
             *)
-                echo "Неизвестный параметр: $1" >&2
+                printf '%s\n' "$(L "Неизвестный параметр: $1" "Unknown option: $1")" >&2
                 print_usage >&2
                 exit 1
                 ;;
@@ -236,7 +254,7 @@ parse_args() {
         shift
     done
     if ((RECONFIGURE + CHECK_ONLY + UNINSTALL > 1)); then
-        echo "Параметры --reconfigure, --check и --uninstall несовместимы." >&2
+        printf '%s\n' "$(L "Параметры --reconfigure, --check и --uninstall несовместимы." "Options --reconfigure, --check and --uninstall cannot be combined.")" >&2
         exit 2
     fi
 }
@@ -245,18 +263,19 @@ parse_args() {
 
 ask() {
     local -n _ask_out="$1"
-    local _ask_prompt="$2" _ask_def="$3" _ask_regex="${4:-}" _ask_err="${5:-Неверный формат.}" _ask_value
+    local _ask_prompt="$2" _ask_def="$3" _ask_regex="${4:-}" _ask_err _ask_value
+    _ask_err="$(L "${5:-Неверный формат.}" "${5:-Invalid format.}")"
     while true; do
         if [[ -n "$_ask_def" ]]; then
             prompted
-            read -r -p "${_ask_prompt} (Enter — ${_ask_def}): " _ask_value || die "Ввод прерван."
+            read -r -p "${_ask_prompt} (Enter — ${_ask_def}): " _ask_value || die "$(L "Ввод прерван." "Input interrupted.")"
         else
             prompted
-            read -r -p "${_ask_prompt}: " _ask_value || die "Ввод прерван."
+            read -r -p "${_ask_prompt}: " _ask_value || die "$(L "Ввод прерван." "Input interrupted.")"
         fi
         _ask_value="${_ask_value:-$_ask_def}"
         if [[ -z "$_ask_value" ]]; then
-            echo "  Поле обязательно."
+            printf '%s\n' "$(L "  Поле обязательно." "  This field is required.")"
             continue
         fi
         if [[ -n "$_ask_regex" && ! "$_ask_value" =~ $_ask_regex ]]; then
@@ -272,7 +291,7 @@ ask_optional() {
     local -n _opt_out="$1"
     local _opt_value
     prompted
-    read -r -p "$2: " _opt_value || die "Ввод прерван."
+    read -r -p "$2: " _opt_value || die "$(L "Ввод прерван." "Input interrupted.")"
     _opt_out="$_opt_value"
 }
 
@@ -281,13 +300,13 @@ ask_yes_no() {
     [[ "$def" == "n" ]] && hint="[y/N]"
     while true; do
         prompted
-        read -r -p "${prompt} ${hint}: " value || die "Ввод прерван."
+        read -r -p "${prompt} ${hint}: " value || die "$(L "Ввод прерван." "Input interrupted.")"
         value="${value:-$def}"
         case "${value,,}" in
             y | yes | д | да) return 0 ;;
             n | no | н | нет) return 1 ;;
         esac
-        echo "  Ожидается y или n."
+        printf '%s\n' "$(L "  Ожидается y или n." "  Expected y or n.")"
     done
 }
 
@@ -296,20 +315,20 @@ ask_password() {
     local _pw_first _pw_second
     while true; do
         prompted
-        read -rs -p "$2 (Enter — случайный): " _pw_first || die "Ввод прерван."
+        read -rs -p "$(L "$2 (Enter — случайный): " "$2 (Enter — random): ")" _pw_first || die "$(L "Ввод прерван." "Input interrupted.")"
         echo
         if [[ -z "$_pw_first" ]]; then
             _pw_out="$(random_string 'A-Za-z0-9' 16)"
             return 0
         fi
         if ((${#_pw_first} < 8)); then
-            echo "  Пароль не короче 8 символов."
+            printf '%s\n' "$(L "  Пароль не короче 8 символов." "  The password must be at least 8 characters.")"
             continue
         fi
-        read -rs -p "Повторите пароль: " _pw_second || die "Ввод прерван."
+        read -rs -p "$(L "Повторите пароль: " "Repeat the password: ")" _pw_second || die "$(L "Ввод прерван." "Input interrupted.")"
         echo
         if [[ "$_pw_first" != "$_pw_second" ]]; then
-            echo "  Пароли не совпадают."
+            printf '%s\n' "$(L "  Пароли не совпадают." "  Passwords do not match.")"
             continue
         fi
         _pw_out="$_pw_first"
@@ -325,6 +344,8 @@ conf_load() {
     while IFS='=' read -r key value; do
         [[ " ${CONF_KEYS[*]} " == *" ${key} "* ]] && CONF[$key]="$value"
     done < "$CONF_FILE"
+    [[ "${CONF[LANGUAGE]:-}" == en ]] && UI_LANG=en
+    return 0
 }
 
 conf_save() {
@@ -375,10 +396,10 @@ ensure_packages() {
         command -v "$cmd" > /dev/null 2>&1 || missing+=("${needed[$cmd]}")
     done
     ((${#missing[@]} == 0)) && return 0
-    log "Установка пакетов: ${missing[*]}."
+    log "$(L "Установка пакетов: ${missing[*]}." "Installing packages: ${missing[*]}.")"
     export DEBIAN_FRONTEND=noninteractive
     if ! apt-get update -qq >> "$LOG_FILE" 2>&1 || ! apt-get install -y -qq "${missing[@]}" >> "$LOG_FILE" 2>&1; then
-        die "Не удалось установить пакеты: ${missing[*]}."
+        die "$(L "Не удалось установить пакеты: ${missing[*]}." "Failed to install packages: ${missing[*]}.")"
     fi
 }
 
@@ -404,6 +425,7 @@ import uuid
 
 REALITY_PORT = 443
 XHTTP_LISTEN = "127.0.0.1"
+HY2_IDLE_TIMEOUT = 300
 FINGERPRINT = "firefox"
 XHTTP_ALPN = ["h2"]
 UDP_PROTOCOLS = {"hysteria", "hysteria2", "wireguard", "amneziawg", "tuic"}
@@ -428,6 +450,16 @@ BLOCK_DOMAIN = ["ext:geosite_RU.dat:ru-available-only-inside", "regexp:.*\\.ru$"
 
 
 # ОБЩИЕ ФУНКЦИИ
+
+UI_LANG = os.environ.get("XUI_LANG", "ru")
+
+
+def L(ru, en):
+    return en if UI_LANG == "en" else ru
+
+
+EMPTY = L("<пусто>", "<empty>")
+
 
 class Failure(Exception):
     pass
@@ -510,7 +542,8 @@ def own_active(inbounds, kind=None):
 
 
 def describe(ib):
-    return f"id={ib['id']} tag={ib['tag']} порт={ib['port']} remark={ib['remark'] or '-'}"
+    return L(f"id={ib['id']} tag={ib['tag']} порт={ib['port']} remark={ib['remark'] or '-'}",
+             f"id={ib['id']} tag={ib['tag']} port={ib['port']} remark={ib['remark'] or '-'}")
 
 
 def clients_of(ib):
@@ -545,11 +578,12 @@ def own_address(address, domain):
 def x25519(xray_bin):
     proc = subprocess.run([xray_bin, "x25519"], capture_output=True, text=True, timeout=15)
     if proc.returncode != 0:
-        raise Failure(f"xray x25519: код {proc.returncode}: {proc.stderr.strip()}")
+        raise Failure(L(f"xray x25519: код {proc.returncode}: {proc.stderr.strip()}",
+                          f"xray x25519: code {proc.returncode}: {proc.stderr.strip()}"))
     private = re.search(r"^PrivateKey:\s*(\S+)", proc.stdout, re.M)
     public = re.search(r"^Password.*?:\s*(\S+)", proc.stdout, re.M)
     if not private or not public:
-        raise Failure("не удалось разобрать вывод xray x25519")
+        raise Failure(L("не удалось разобрать вывод xray x25519", "failed to parse xray x25519 output"))
     return private.group(1), public.group(1)
 
 
@@ -610,15 +644,17 @@ def cmd_validate_db(path):
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         check = conn.execute("PRAGMA integrity_check").fetchone()[0]
         if check != "ok":
-            raise Failure(f"проверка целостности не пройдена: {check}")
+            raise Failure(L(f"проверка целостности не пройдена: {check}", f"integrity check failed: {check}"))
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         conn.close()
         missing = {"inbounds", "settings"} - tables
         if missing:
             raise Failure(
-                "нет таблиц 3x-ui (" + ", ".join(sorted(missing)) + "). Вероятно, база скопирована без checkpoint: "
-                "на старом сервере выполните sqlite3 /etc/x-ui/x-ui.db \"PRAGMA wal_checkpoint(TRUNCATE);\" "
-                "и скопируйте файл заново")
+                L("нет таблиц 3x-ui (", "no 3x-ui tables (") + ", ".join(sorted(missing))
+                + L("). Вероятно, база скопирована без checkpoint: на старом сервере выполните "
+                    "sqlite3 /etc/x-ui/x-ui.db \"PRAGMA wal_checkpoint(TRUNCATE);\" и скопируйте файл заново",
+                    "). The database was probably copied without a checkpoint: run "
+                    "sqlite3 /etc/x-ui/x-ui.db \"PRAGMA wal_checkpoint(TRUNCATE);\" on the old server and copy the file again"))
         print("ok")
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -662,7 +698,7 @@ def cmd_import_prepare(db, xray_bin, domain, target):
 
 def drop_external_proxy(stream, notes):
     if stream.get("externalProxy"):
-        notes.append("externalProxy удалён: ссылки строятся из Хостов")
+        notes.append(L("externalProxy удалён: ссылки строятся из Хостов", "externalProxy removed: links are built from Hosts"))
         del stream["externalProxy"]
 
 
@@ -702,10 +738,10 @@ def normalize_reality(ib, domain, target):
     notes, fields = [], {}
     rs = stream.get("realitySettings")
     if not isinstance(rs, dict):
-        raise Failure(f"{describe(ib)}: security=reality без realitySettings")
+        raise Failure(L(f"{describe(ib)}: security=reality без realitySettings", f"{describe(ib)}: security=reality without realitySettings"))
     current = rs.get("target") or rs.get("dest") or ""
     if current != target or ("dest" in rs and rs["dest"] != target):
-        notes.append(f"target {current or '<пусто>'} → {target}")
+        notes.append(f"target {current or EMPTY} → {target}")
         rs["target"] = target
         if "dest" in rs:
             rs["dest"] = target
@@ -721,14 +757,14 @@ def normalize_reality(ib, domain, target):
         notes.append(f"xver {rs.get('xver')} → 0")
         rs["xver"] = 0
     for key in limit_fallback_active(rs):
-        notes.append(f"{key} удалён")
+        notes.append(L(f"{key} удалён", f"{key} removed"))
         del rs[key]
     if (stream.get("network") or "").lower() == "raw":
         notes.append("network raw → tcp")
         stream["network"] = "tcp"
     drop_external_proxy(stream, notes)
     if (ib["listen"] or "").strip():
-        notes.append(f"listen {ib['listen']} → пусто")
+        notes.append(f"listen {ib['listen']} → {EMPTY}")
         fields["listen"] = ""
     normalize_sniffing(ib, notes, fields)
     return stream, fields, notes
@@ -742,10 +778,10 @@ def normalize_xhttp(ib, domain, path, port):
         xs = {}
         stream["xhttpSettings"] = xs
     if xs.get("path") != path:
-        notes.append("путь XHTTP изменён")
+        notes.append(L("путь XHTTP изменён", "XHTTP path changed"))
         xs["path"] = path
     if xs.get("mode") != "stream-one":
-        notes.append(f"mode {xs.get('mode') or '<пусто>'} → stream-one")
+        notes.append(f"mode {xs.get('mode') or EMPTY} → stream-one")
         xs["mode"] = "stream-one"
     if (stream.get("security") or "none") != "none":
         notes.append(f"security {stream.get('security')} → none")
@@ -754,13 +790,17 @@ def normalize_xhttp(ib, domain, path, port):
         stream.pop("realitySettings", None)
     drop_external_proxy(stream, notes)
     if (ib["listen"] or "").strip() != XHTTP_LISTEN:
-        notes.append(f"listen {ib['listen'] or '<пусто>'} → {XHTTP_LISTEN}")
+        notes.append(f"listen {ib['listen'] or EMPTY} → {XHTTP_LISTEN}")
         fields["listen"] = XHTTP_LISTEN
     if ib["port"] != port:
-        notes.append(f"порт {ib['port']} → {port}")
+        notes.append(L(f"порт {ib['port']} → {port}", f"port {ib['port']} → {port}"))
         fields["port"] = port
     normalize_sniffing(ib, notes, fields)
     return stream, fields, notes
+
+
+def hy2_masquerade(domain):
+    return {"type": "proxy", "url": f"https://{domain}:{REALITY_PORT}", "rewriteHost": True}
 
 
 def normalize_hy2(ib, domain, cert_folder, port):
@@ -769,14 +809,14 @@ def normalize_hy2(ib, domain, cert_folder, port):
     fullchain = f"/etc/ssl/{cert_folder}/fullchain.pem"
     privkey = f"/etc/ssl/{cert_folder}/privkey.pem"
     if (stream.get("security") or "") != "tls":
-        notes.append(f"security {stream.get('security') or '<пусто>'} → tls")
+        notes.append(f"security {stream.get('security') or EMPTY} → tls")
         stream["security"] = "tls"
     tls = stream.get("tlsSettings")
     if not isinstance(tls, dict):
         tls = {}
         stream["tlsSettings"] = tls
     if tls.get("serverName") != domain:
-        notes.append(f"serverName {tls.get('serverName') or '<пусто>'} → {domain}")
+        notes.append(f"serverName {tls.get('serverName') or EMPTY} → {domain}")
         tls["serverName"] = domain
     certs = tls.get("certificates")
     if not isinstance(certs, list) or not certs or not all(isinstance(c, dict) for c in certs):
@@ -786,28 +826,57 @@ def normalize_hy2(ib, domain, cert_folder, port):
         cert = {k: v for k, v in cert.items() if k not in ("certificate", "key")}
         cert["certificateFile"] = fullchain
         cert["keyFile"] = privkey
+        if cert.get("oneTimeLoading"):
+            cert["oneTimeLoading"] = False
         wanted.append(cert)
     if wanted != tls.get("certificates"):
-        notes.append(f"сертификат → /etc/ssl/{cert_folder}/")
+        notes.append(L(f"сертификат → /etc/ssl/{cert_folder}/", f"certificate → /etc/ssl/{cert_folder}/"))
         tls["certificates"] = wanted
     if tls.get("alpn") != ["h3"]:
         notes.append(f"alpn {tls.get('alpn')} → ['h3']")
         tls["alpn"] = ["h3"]
+    if tls.get("rejectUnknownSni") is not True:
+        notes.append(L("rejectUnknownSni → вкл", "rejectUnknownSni → on"))
+        tls["rejectUnknownSni"] = True
     hs = stream.get("hysteriaSettings")
     if not isinstance(hs, dict):
         hs = {}
         stream["hysteriaSettings"] = hs
     if as_int(hs.get("version")) != 2:
-        notes.append(f"версия Hysteria {hs.get('version')} → 2")
+        notes.append(L(f"версия Hysteria {hs.get('version')} → 2", f"Hysteria version {hs.get('version')} → 2"))
         hs["version"] = 2
-    masquerade = hs.get("masquerade")
-    wanted_url = f"https://{domain}:{REALITY_PORT}"
-    if isinstance(masquerade, dict) and masquerade.get("url") and masquerade["url"] != wanted_url:
-        notes.append(f"masquerade {masquerade['url']} → {wanted_url}")
-        masquerade["url"] = wanted_url
+    if as_int(hs.get("udpIdleTimeout")) != HY2_IDLE_TIMEOUT:
+        notes.append(f"udpIdleTimeout {hs.get('udpIdleTimeout') or EMPTY} → {HY2_IDLE_TIMEOUT}")
+        hs["udpIdleTimeout"] = HY2_IDLE_TIMEOUT
+    for key in ("up", "down", "udphop"):
+        if hs.get(key):
+            notes.append(L(f"{key} удалён", f"{key} removed"))
+            del hs[key]
+    masquerade = hs.get("masquerade") if isinstance(hs.get("masquerade"), dict) else {}
+    wanted_masquerade = hy2_masquerade(domain)
+    if any(masquerade.get(k) != v for k, v in wanted_masquerade.items()) or masquerade.get("xForwarded") \
+            or masquerade.get("insecure"):
+        notes.append(f"masquerade {masquerade.get('type') or EMPTY} {masquerade.get('url') or EMPTY} "
+                     f"→ proxy {wanted_masquerade['url']}")
+        masquerade.update(wanted_masquerade)
+        masquerade.pop("xForwarded", None)
+        masquerade.pop("insecure", None)
+        hs["masquerade"] = masquerade
+    fm = stream.get("finalmask") if isinstance(stream.get("finalmask"), dict) else None
+    if fm is not None and (fm.get("udp") or fm.get("quicParams")):
+        masks = [str(m.get("type")) for m in fm.get("udp") or [] if isinstance(m, dict)]
+        if masks:
+            notes.append(L(f"UDP-маски {', '.join(masks)} удалены", f"UDP masks {', '.join(masks)} removed"))
+        if fm.get("quicParams"):
+            notes.append(L("quicParams удалён", "quicParams removed"))
+        fm["udp"] = []
+        fm.pop("quicParams", None)
     drop_external_proxy(stream, notes)
+    if (ib["listen"] or "").strip():
+        notes.append(f"listen {ib['listen']} → {EMPTY}")
+        fields["listen"] = ""
     if ib["port"] != port:
-        notes.append(f"порт {ib['port']} → {port}")
+        notes.append(L(f"порт {ib['port']} → {port}", f"port {ib['port']} → {port}"))
         fields["port"] = port
     normalize_sniffing(ib, notes, fields)
     return stream, fields, notes
@@ -821,7 +890,7 @@ def unique_tag(port, transport, taken):
         candidate = f"{base}-{n}"
         if candidate not in taken:
             return candidate
-    raise Failure(f"нет свободного тега для порта {port}")
+    raise Failure(L(f"нет свободного тега для порта {port}", f"no free tag for port {port}"))
 
 
 def rename_template_tags(cur, renamed):
@@ -867,7 +936,8 @@ def cmd_inbounds(mode, db, domain, cert_folder, xhttp_path, hy2_port, target, xh
     for kind in KINDS:
         found = own_active(inbounds, kind)
         if len(found) > 1:
-            report["fatal"].append(f"{KIND_NAMES[kind]}: включено несколько инбаундов, допускается один: "
+            report["fatal"].append(L(f"{KIND_NAMES[kind]}: включено несколько инбаундов, допускается один: ",
+                                     f"{KIND_NAMES[kind]}: several inbounds are enabled, only one is allowed: ")
                                    + "; ".join(describe(ib) for ib in found))
         elif found:
             selected[kind] = found[0]
@@ -893,7 +963,7 @@ def cmd_inbounds(mode, db, domain, cert_folder, xhttp_path, hy2_port, target, xh
             port_fields = {"port": REALITY_PORT}
             if AUTO_TAG.match(ib["tag"] or ""):
                 port_fields["tag"] = unique_tag(REALITY_PORT, "tcp", taken - {ib["tag"]})
-            plans.append(("port", ib, None, port_fields, [f"порт {ib['port']} → {REALITY_PORT}"]))
+            plans.append(("port", ib, None, port_fields, [L(f"порт {ib['port']} → {REALITY_PORT}", f"port {ib['port']} → {REALITY_PORT}")]))
     if "xhttp" in selected and xhttp_path:
         ib = selected["xhttp"]
         stream, fields, notes = normalize_xhttp(ib, domain, xhttp_path, xhttp_port)
@@ -904,17 +974,21 @@ def cmd_inbounds(mode, db, domain, cert_folder, xhttp_path, hy2_port, target, xh
         plans.append(("main", ib, stream, fields, notes))
     for kind, ib in selected.items():
         if tag_suffixed(ib["tag"]):
-            report["warnings"].append(f"{KIND_NAMES[kind]} ({describe(ib)}): тег с суффиксом — если сервер станет "
-                                      "узлом мастер-панели 3x-ui, синхронизация не найдёт этот инбаунд")
+            report["warnings"].append(L(f"{KIND_NAMES[kind]} ({describe(ib)}): тег с суффиксом — если сервер станет "
+                                        "узлом мастер-панели 3x-ui, синхронизация не найдёт этот инбаунд",
+                                        f"{KIND_NAMES[kind]} ({describe(ib)}): suffixed tag — if the server becomes "
+                                        "a node of a 3x-ui master panel, sync will not find this inbound"))
     chosen = {ib["id"] for ib in selected.values()}
     for ib in own_active(inbounds):
         if ib["id"] in chosen:
             continue
         if ib["transport"] == "tcp" and ib["public"]:
             plans.append(("main", ib, None, {"enable": 0},
-                          [f"выключен: публичный TCP-порт кроме {REALITY_PORT} не допускается"]))
+                          [L(f"выключен: публичный TCP-порт кроме {REALITY_PORT} не допускается",
+                            f"disabled: no public TCP port other than {REALITY_PORT} is allowed")]))
         elif ib["transport"] == "udp" and ib["public"]:
-            report["warnings"].append(f"{describe(ib)}: UDP-инбаунд оставлен включённым, но его порт в ufw не открывается")
+            report["warnings"].append(L(f"{describe(ib)}: UDP-инбаунд оставлен включённым, но его порт в ufw не открывается",
+                                        f"{describe(ib)}: the UDP inbound stays enabled, but its port is not opened in ufw"))
 
     for stage, ib, stream, fields, notes in plans:
         if stream is not None and stream == ib["stream"]:
@@ -980,7 +1054,7 @@ def same_value(key, current, wanted, single_name=True):
 def host_value(key, value):
     if key == "alpn":
         value = ",".join(json_list(value))
-    return value if value not in (None, "") else "<пусто>"
+    return value if value not in (None, "") else EMPTY
 
 
 def cmd_hosts(mode, db, domain, hy2_port):
@@ -990,7 +1064,7 @@ def cmd_hosts(mode, db, domain, hy2_port):
     rows, present = host_rows(cur)
     report = {"problems": [], "changes": [], "missing": [], "fixable": 0}
     if rows is None:
-        report["problems"].append("в базе нет таблицы hosts")
+        report["problems"].append(L("в базе нет таблицы hosts", "the database has no hosts table"))
         conn.close()
         emit(report)
         return
@@ -1009,20 +1083,23 @@ def cmd_hosts(mode, db, domain, hy2_port):
                 own_hosts.append(host)
         if not own_hosts:
             report["missing"].append({"kind": kind, "inbound_id": ib["id"], "remark": REMARKS[kind], **wanted})
-            report["problems"].append(f"{KIND_NAMES[kind]}: нет Хоста {domain}:{wanted['port']}")
+            report["problems"].append(L(f"{KIND_NAMES[kind]}: нет Хоста {domain}:{wanted['port']}",
+                                         f"{KIND_NAMES[kind]}: no Host {domain}:{wanted['port']}"))
             continue
         for host in own_hosts:
             diffs = {k: v for k, v in wanted.items() if k in present and not same_value(k, host.get(k), v, single_name)}
             if not diffs:
                 continue
             text = ", ".join(f"{k} {host_value(k, host.get(k))} → {host_value(k, v)}" for k, v in diffs.items())
-            report["problems"].append(f"{KIND_NAMES[kind]}: Хост id={host['id']}: {text}")
+            report["problems"].append(L(f"{KIND_NAMES[kind]}: Хост id={host['id']}: {text}",
+                                       f"{KIND_NAMES[kind]}: Host id={host['id']}: {text}"))
             report["fixable"] += 1
             if mode == "fix":
                 assignments = ", ".join(f"{k}=?" for k in diffs)
                 values = [json.dumps(v) if isinstance(v, list) else v for v in diffs.values()]
                 cur.execute(f"UPDATE hosts SET {assignments} WHERE id=?", (*values, host["id"]))
-                report["changes"].append(f"{KIND_NAMES[kind]}: Хост id={host['id']}: {text}")
+                report["changes"].append(L(f"{KIND_NAMES[kind]}: Хост id={host['id']}: {text}",
+                                          f"{KIND_NAMES[kind]}: Host id={host['id']}: {text}"))
     if mode == "fix":
         conn.commit()
     conn.close()
@@ -1051,7 +1128,7 @@ def cmd_settings_diff(db, *pairs):
         if current is None:
             current = SETTING_DEFAULTS.get(key, "")
         if current != wanted:
-            print(f"{key}: {current or '<пусто>'} → {wanted or '<пусто>'}")
+            print(f"{key}: {current or EMPTY} → {wanted or EMPTY}")
 
 
 def cmd_settings_set(db, *pairs):
@@ -1116,7 +1193,7 @@ class Api:
         except (urllib.error.URLError, OSError, ValueError) as e:
             raise Failure(f"{path}: {e}")
         if not parsed.get("success"):
-            raise Failure(f"{path}: {parsed.get('msg') or 'ошибка'}")
+            raise Failure(f"{path}: {parsed.get('msg') or L('ошибка', 'error')}")
         return parsed.get("obj")
 
 
@@ -1183,18 +1260,16 @@ def hy2_inbound(p, clients):
         "streamSettings": {
             "network": "hysteria", "security": "tls",
             "hysteriaSettings": {
-                "version": 2, "udpIdleTimeout": 300,
-                "masquerade": {"type": "proxy", "url": f"https://{p['domain']}:{REALITY_PORT}", "rewriteHost": True},
+                "version": 2, "udpIdleTimeout": HY2_IDLE_TIMEOUT, "masquerade": hy2_masquerade(p["domain"]),
             },
             "tlsSettings": {
                 "serverName": p["domain"], "minVersion": "1.2", "maxVersion": "1.3", "alpn": ["h3"],
+                "rejectUnknownSni": True,
                 "certificates": [{
                     "certificateFile": f"/etc/ssl/{p['cert_folder']}/fullchain.pem",
                     "keyFile": f"/etc/ssl/{p['cert_folder']}/privkey.pem",
                 }],
             },
-            "finalmask": {"tcp": [], "udp": [{"type": "salamander",
-                                              "settings": {"password": secrets.token_urlsafe(16)}}]},
         },
     }
 
@@ -1309,6 +1384,11 @@ def cmd_config_summary(path):
             continue
         entry = {"tag": ib.get("tag") or "", "port": ib.get("port"), "listen": ib.get("listen") or "",
                  "sniffing": sniffing_ok(ib.get("sniffing"))}
+        if kind == "hy2":
+            fm = stream.get("finalmask") if isinstance(stream.get("finalmask"), dict) else {}
+            tls = stream.get("tlsSettings") if isinstance(stream.get("tlsSettings"), dict) else {}
+            entry["plain"] = not fm.get("udp") and not fm.get("quicParams")
+            entry["reject_sni"] = tls.get("rejectUnknownSni") is True
         if kind == "reality":
             rs = stream.get("realitySettings") or {}
             entry["target"] = str(rs.get("target") or rs.get("dest") or "")
@@ -1352,7 +1432,8 @@ def xray_test(config_path, xray_bin, rules):
         if value.startswith("ext:"):
             name = value.split(":")[1]
             if not os.path.isfile(os.path.join(assets, name)):
-                raise Failure(f"нет файла {os.path.join(assets, name)} для {value}")
+                raise Failure(L(f"нет файла {os.path.join(assets, name)} для {value}",
+                                  f"no file {os.path.join(assets, name)} for {value}"))
     with open(config_path) as f:
         config = json.load(f)
     config.setdefault("routing", {}).setdefault("rules", [])[0:0] = rules
@@ -1366,7 +1447,7 @@ def xray_test(config_path, xray_bin, rules):
         os.unlink(path)
     if proc.returncode != 0:
         lines = [line for line in (proc.stdout + proc.stderr).splitlines() if line.strip()]
-        raise Failure("xray -test: " + (lines[-1] if lines else f"код {proc.returncode}"))
+        raise Failure("xray -test: " + (lines[-1] if lines else L(f"код {proc.returncode}", f"code {proc.returncode}")))
 
 
 def cmd_routing_apply(base, token, reality_tag, xhttp_tag, config_path, xray_bin):
@@ -1378,13 +1459,13 @@ def cmd_routing_apply(base, token, reality_tag, xhttp_tag, config_path, xray_bin
     changed = add_block_rules(rules, missing)
     if changed:
         xray_test(config_path, xray_bin, json.loads(json.dumps(changed)))
-        changes.append("blocked: добавлено " + ", ".join(v for values in missing.values() for v in values))
+        changes.append(L("blocked: добавлено ", "blocked: added ") + ", ".join(v for values in missing.values() for v in values))
     tags = sorted({tag for tag in (reality_tag, xhttp_tag) if tag})
     old = [r for r in rules if is_udp443_block(r)]
     if len(old) != 1 or sorted(set(old[0].get("inboundTag") or [])) != tags:
         rules[:] = [r for r in rules if not is_udp443_block(r)]
         rules.append({"type": "field", "network": "udp", "port": "443", "inboundTag": tags, "outboundTag": "blocked"})
-        changes.append(f"UDP/443 → blocked для {tags}")
+        changes.append(L(f"UDP/443 → blocked для {tags}", f"UDP/443 → blocked for {tags}"))
     if changes:
         api.call("panel/api/xray/update", form={"xraySetting": json.dumps(template)})
     emit({"changes": changes})
@@ -1401,17 +1482,17 @@ def cmd_routing_test(base, token, reality_tag, xhttp_tag):
 
     probe = "probe-" + "".join(c for c in reality_tag + xhttp_tag if c.isalnum())
     checks = {
-        "Reality UDP/443 блокируется": blocked(reality_tag, "udp", ip="8.8.8.8"),
-        "другой инбаунд UDP/443 не блокируется": not blocked(probe, "udp", ip="8.8.8.8"),
-        "TCP/443 не блокируется": not blocked(reality_tag, ip="8.8.8.8"),
-        "geoip:private блокируется": blocked(reality_tag, ip="10.0.0.1"),
-        "RU IP блокируется": blocked(reality_tag, ip="77.88.8.8"),
-        "домен .ru блокируется": blocked(reality_tag, domain="test.ru"),
-        "example.com не блокируется": not blocked(reality_tag, domain="example.com"),
-        "bittorrent блокируется": blocked(reality_tag, ip="8.8.8.8", protocol="bittorrent"),
+        L("Reality UDP/443 блокируется", "Reality UDP/443 is blocked"): blocked(reality_tag, "udp", ip="8.8.8.8"),
+        L("другой инбаунд UDP/443 не блокируется", "another inbound UDP/443 is not blocked"): not blocked(probe, "udp", ip="8.8.8.8"),
+        L("TCP/443 не блокируется", "TCP/443 is not blocked"): not blocked(reality_tag, ip="8.8.8.8"),
+        L("geoip:private блокируется", "geoip:private is blocked"): blocked(reality_tag, ip="10.0.0.1"),
+        L("RU IP блокируется", "RU IP is blocked"): blocked(reality_tag, ip="77.88.8.8"),
+        L("домен .ru блокируется", "a .ru domain is blocked"): blocked(reality_tag, domain="test.ru"),
+        L("example.com не блокируется", "example.com is not blocked"): not blocked(reality_tag, domain="example.com"),
+        L("bittorrent блокируется", "bittorrent is blocked"): blocked(reality_tag, ip="8.8.8.8", protocol="bittorrent"),
     }
     if xhttp_tag:
-        checks["XHTTP UDP/443 блокируется"] = blocked(xhttp_tag, "udp", ip="8.8.8.8")
+        checks[L("XHTTP UDP/443 блокируется", "XHTTP UDP/443 is blocked")] = blocked(xhttp_tag, "udp", ip="8.8.8.8")
     failed = [name for name, ok in checks.items() if not ok]
     emit({"failed": failed})
     if failed:
@@ -1487,9 +1568,9 @@ def cmd_db_newer(imported, installed):
     tables, seeders = db_signature(imported)
     known_tables, known_seeders = db_signature(installed)
     for name in sorted(seeders - known_seeders):
-        print(f"миграция {name}")
+        print(L(f"миграция {name}", f"migration {name}"))
     for name in sorted(tables - known_tables):
-        print(f"таблица {name}")
+        print(L(f"таблица {name}", f"table {name}"))
 
 
 # ЗАПУСК
@@ -1521,7 +1602,7 @@ COMMANDS = {
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
-        print("неизвестная команда")
+        print(L("неизвестная команда", "unknown command"))
         sys.exit(2)
     try:
         COMMANDS[sys.argv[1]](*sys.argv[2:])
@@ -1538,7 +1619,7 @@ PYEOF
 }
 
 py() {
-    python3 -c "$PY_HELPER" "$@"
+    XUI_LANG="$UI_LANG" python3 -c "$PY_HELPER" "$@"
 }
 
 json_get() {
@@ -1559,8 +1640,12 @@ tcp_listening() {
     tcp_listeners "$2" | awk '{print $4}' | grep -qxF "$1:$2"
 }
 
-udp_listening() {
-    [[ -n "$(ss -Hulnp "sport = :$1" 2> /dev/null)" ]]
+udp_listeners() {
+    ss -Hulnp "sport = :$1" 2> /dev/null
+}
+
+xray_holds_udp() {
+    udp_listeners "$1" | grep -q '"xray'
 }
 
 tcp_port_free() {
@@ -1718,7 +1803,7 @@ xui_stop() {
 xui_start() {
     systemctl reset-failed x-ui > /dev/null 2>&1 || true
     if ! systemctl start x-ui > /dev/null 2>&1 || ! wait_for 30 xui_ready; then
-        log "x-ui не запустился, журнал x-ui записан в ${LOG_FILE}"
+        log "$(L "x-ui не запустился, журнал x-ui записан в ${LOG_FILE}" "x-ui did not start, the x-ui journal is saved to ${LOG_FILE}")"
         journal_tail x-ui
         return 1
     fi
@@ -1733,8 +1818,8 @@ xui_restart() {
 backup_db_once() {
     [[ -n "$DB_BACKUP" || ! -s "$XUI_DB" ]] && return 0
     DB_BACKUP="${XUI_DB}.bak-$(date +%F-%H%M%S)"
-    cp "$XUI_DB" "$DB_BACKUP" || die "Не удалось сделать резервную копию базы ${XUI_DB}"
-    log "Резервная копия базы: ${DB_BACKUP}"
+    cp "$XUI_DB" "$DB_BACKUP" || die "$(L "Не удалось сделать резервную копию базы ${XUI_DB}" "Failed to back up the database ${XUI_DB}")"
+    log "$(L "Резервная копия базы: ${DB_BACKUP}" "Database backup: ${DB_BACKUP}")"
 }
 
 api_token() {
@@ -1742,7 +1827,7 @@ api_token() {
     out=$("$XUI_BIN" setting -getApiToken -tokenName "$SCRIPT_NAME" 2>&1)
     token=$(printf '%s\n' "$out" | grep -Eo 'apiToken: *[^ ]+' | awk '{print $2}')
     if [[ -z "$token" ]]; then
-        log "API-токен панели не получен"
+        log "$(L "API-токен панели не получен" "Panel API token not received")"
         log_quiet "$out"
         return 1
     fi
@@ -1786,7 +1871,7 @@ xhttp_path_answer() {
 
 hy2_port_answer() {
     if [[ "$(conf_get HY2)" == yes ]]; then
-        conf_get HY2_PORT
+        printf '%s' "$HY2_PORT"
     else
         printf '0'
     fi
@@ -1798,14 +1883,14 @@ converge() {
     local title="$1" name="$2"
     step "$title"
     if "check_${name}"; then
-        report_ok "без изменений"
+        report_ok "$(L "без изменений" "no changes")"
         step_end
         return 0
     fi
-    "apply_${name}" || die "не удалось привести к целевому состоянию"
-    log_quiet "Повторная проверка."
-    "check_${name}" || die "после изменений проверка не пройдена"
-    report_ok "готово"
+    "apply_${name}" || die "$(L "не удалось привести к целевому состоянию" "failed to reach the target state")"
+    log_quiet "$(L "Повторная проверка." "Checking again.")"
+    "check_${name}" || die "$(L "после изменений проверка не пройдена" "check failed after the changes")"
+    report_ok "$(L "готово" "done")"
     step_end
 }
 
@@ -1833,6 +1918,31 @@ resolve_answer() {
     conf_set "$key" "$value"
 }
 
+resolve_language() {
+    local choice def=1
+    if [[ "$RECONFIGURE" -eq 0 ]]; then
+        [[ -n "$(conf_get LANGUAGE)" || -n "$(conf_get DOMAIN)" || -s "$XUI_DB" ]] && return 0
+    fi
+    [[ "$UI_LANG" == en ]] && def=2
+    echo "Язык / Language:"
+    echo "  1  Русский"
+    echo "  2  English"
+    while true; do
+        prompted
+        read -r -p "Выбор / Choice (Enter — ${def}): " choice || die "$(L "Ввод прерван." "Input interrupted.")"
+        case "${choice:-$def}" in
+            1) UI_LANG=ru ;;
+            2) UI_LANG=en ;;
+            *)
+                echo "  1 / 2"
+                continue
+                ;;
+        esac
+        conf_set LANGUAGE "$UI_LANG"
+        return 0
+    done
+}
+
 resolve_install_mode() {
     local choice
     if [[ "$RECONFIGURE" -eq 1 ]]; then
@@ -1841,14 +1951,14 @@ resolve_install_mode() {
     fi
     [[ -n "$(conf_get INSTALL_MODE)" || -n "$(conf_get DOMAIN)" ]] && return 0
     xui_has_config && return 0
-    echo "Вариант установки:"
-    echo "  1  Стандартная — только VLESS Reality на 443, нужны домен и email,"
-    echo "     остальные параметры заполняются автоматически"
-    echo "  2  Расширенная — дополнительно XHTTP и Hysteria2, свои пути, логин и пароль панели,"
-    echo "     перенос базы x-ui.db"
+    printf '%s\n' "$(L "Вариант установки:" "Installation type:")"
+    printf '%s\n' "$(L "  1  Стандартная — только VLESS Reality на 443, нужны домен и email," "  1  Standard — VLESS Reality on 443 only, the domain and email are needed,")"
+    printf '%s\n' "$(L "     остальные параметры заполняются автоматически" "     everything else is filled in automatically")"
+    printf '%s\n' "$(L "  2  Расширенная — дополнительно XHTTP и Hysteria2, свои пути, логин и пароль панели," "  2  Extended — XHTTP and Hysteria2 on top, custom paths, panel username and password,")"
+    printf '%s\n' "$(L "     перенос базы x-ui.db" "     moving an x-ui.db database")"
     while true; do
         prompted
-        read -r -p "Выбор (Enter — 1): " choice || die "Ввод прерван."
+        read -r -p "$(L "Выбор (Enter — 1): " "Choice (Enter — 1): ")" choice || die "$(L "Ввод прерван." "Input interrupted.")"
         case "${choice:-1}" in
             1)
                 conf_set INSTALL_MODE recommended
@@ -1859,18 +1969,18 @@ resolve_install_mode() {
                 return 0
                 ;;
         esac
-        echo "  Ожидается 1 или 2."
+        printf '%s\n' "$(L "  Ожидается 1 или 2." "  Expected 1 or 2.")"
     done
 }
 
 resolve_base_answers() {
-    resolve_answer DOMAIN "Домен сервера (например srv1.example.com)" "$(discover_domain)" \
-        "$DOMAIN_RE" "Некорректный домен. Пример: srv1.example.com"
+    resolve_answer DOMAIN "$(L "Домен сервера (например srv1.example.com)" "Server domain (for example srv1.example.com)")" "$(discover_domain)" \
+        "$DOMAIN_RE" "$(L "Некорректный домен. Пример: srv1.example.com" "Invalid domain. Example: srv1.example.com")"
     recommended && [[ -z "$(conf_get CERT_FOLDER)" ]] && conf_set CERT_FOLDER "$(conf_get DOMAIN)"
-    resolve_answer CERT_FOLDER "Папка сертификата в /etc/ssl/" "$(conf_get DOMAIN)" \
-        "$FOLDER_RE" "Только буквы, цифры, точка, дефис, подчёркивание."
-    resolve_answer ACME_EMAIL "Email для Let's Encrypt" "$(discover_email)" \
-        "$EMAIL_RE" "Некорректный email. Пример: you@example.com"
+    resolve_answer CERT_FOLDER "$(L "Папка сертификата в /etc/ssl/" "Certificate folder in /etc/ssl/")" "$(conf_get DOMAIN)" \
+        "$FOLDER_RE" "$(L "Только буквы, цифры, точка, дефис, подчёркивание." "Letters, digits, dot, hyphen and underscore only.")"
+    resolve_answer ACME_EMAIL "$(L "Email для Let's Encrypt" "Email for Let's Encrypt")" "$(discover_email)" \
+        "$EMAIL_RE" "$(L "Некорректный email. Пример: you@example.com" "Invalid email. Example: you@example.com")"
 }
 
 resolve_import() {
@@ -1882,17 +1992,17 @@ resolve_import() {
     fi
     while true; do
         if xui_has_config; then
-            ask_optional path "Путь к x-ui.db для переноса (Enter — оставить текущую базу)"
+            ask_optional path "$(L "Путь к x-ui.db для переноса (Enter — оставить текущую базу)" "Path to x-ui.db to move (Enter — keep the current database)")"
         else
-            ask_optional path "Путь к x-ui.db для переноса с другого сервера (Enter — установка с нуля)"
+            ask_optional path "$(L "Путь к x-ui.db для переноса с другого сервера (Enter — установка с нуля)" "Path to x-ui.db from another server (Enter — fresh install)")"
         fi
         [[ -z "$path" ]] && return 0
         if [[ ! -f "$path" ]]; then
-            echo "  Файл не найден."
+            printf '%s\n' "$(L "  Файл не найден." "  File not found.")"
             continue
         fi
         if [[ "$(head -c 15 "$path" 2> /dev/null)" != "SQLite format 3" ]]; then
-            echo "  Это не база SQLite."
+            printf '%s\n' "$(L "  Это не база SQLite." "  This is not an SQLite database.")"
             continue
         fi
         if ! reason=$(py validate-db "$path" 2>&1); then
@@ -1911,7 +2021,7 @@ resolve_path() {
         discovered=$(normalize_path "$discovered")
         if [[ "$discovered" =~ ^(/[A-Za-z0-9_-]+)+$ ]]; then
             conf_set "$key" "$discovered"
-            log "${prompt}: взят из базы 3x-ui."
+            log "$(L "${prompt}: взят из базы 3x-ui." "${prompt}: taken from the 3x-ui database.")"
             return 0
         fi
     fi
@@ -1922,14 +2032,14 @@ resolve_path() {
     fi
     while true; do
         if [[ -n "$current" ]]; then
-            ask_optional value "${prompt} (Enter — оставить текущий)"
+            ask_optional value "$(L "${prompt} (Enter — оставить текущий)" "${prompt} (Enter — keep the current one)")"
             value="${value:-$current}"
         else
-            ask_optional value "${prompt} (Enter — случайная строка)"
+            ask_optional value "$(L "${prompt} (Enter — случайная строка)" "${prompt} (Enter — random string)")"
             value="${value:-$(random_string 'a-z0-9' 14)}"
         fi
         if [[ ! "$value" =~ $PATH_RE ]]; then
-            echo "  Разрешены буквы, цифры, дефис, подчёркивание и / между частями пути."
+            printf '%s\n' "$(L "  Разрешены буквы, цифры, дефис, подчёркивание и / между частями пути." "  Letters, digits, hyphen, underscore and / between path parts are allowed.")"
             continue
         fi
         conf_set "$key" "$(normalize_path "$value")"
@@ -1962,7 +2072,7 @@ resolve_xhttp() {
         conf_set XHTTP no
         return 0
     fi
-    if ask_yes_no "Добавить VLESS XHTTP?" y; then
+    if ask_yes_no "$(L "Добавить VLESS XHTTP?" "Add VLESS XHTTP?")" y; then
         conf_set XHTTP yes
     else
         conf_set XHTTP no
@@ -1973,18 +2083,18 @@ resolve_xhttp() {
 xhttp_port_invalid() {
     local port="$1" p
     if [[ ! "$port" =~ ^[0-9]{1,5}$ ]] || ((10#$port < 1024 || 10#$port > 65535)); then
-        echo "допустимо 1024–65535"
+        printf '%s\n' "$(L "допустимо 1024–65535" "allowed 1024–65535")"
         return 0
     fi
     port=$((10#$port))
     for p in "${INTERNAL_PORTS[@]}" "$HTTP_PORT" "$PUBLIC_TLS_PORT" $(ssh_ports); do
         if ((port == p)); then
-            echo "порт ${port} занят службой сервера"
+            printf '%s\n' "$(L "порт ${port} занят службой сервера" "port ${port} is used by a server service")"
             return 0
         fi
     done
     if ! tcp_port_free "$port"; then
-        echo "TCP/${port} уже занят"
+        printf '%s\n' "$(L "TCP/${port} уже занят" "TCP/${port} is already in use")"
         return 0
     fi
     return 1
@@ -2004,10 +2114,10 @@ resolve_xhttp_port() {
         return 0
     fi
     while true; do
-        ask_optional value "Внутренний порт XHTTP (Enter — $(xhttp_port), допустимо 1024–65535)"
+        ask_optional value "$(L "Внутренний порт XHTTP (Enter — $(xhttp_port), допустимо 1024–65535)" "Internal XHTTP port (Enter — $(xhttp_port), allowed 1024–65535)")"
         value="${value:-$(xhttp_port)}"
         if reason=$(xhttp_port_invalid "$value"); then
-            echo "  Не подходит: ${reason}."
+            printf '%s\n' "$(L "  Не подходит: ${reason}." "  Not suitable: ${reason}.")"
             continue
         fi
         conf_set XHTTP_PORT "$((10#$value))"
@@ -2018,11 +2128,11 @@ resolve_xhttp_port() {
 resolve_paths() {
     local discovered="{}" key
     xui_has_config && discovered=$(xui_discover)
-    xhttp_enabled && resolve_path XHTTP_PATH "Секретный путь XHTTP" "$(json_get "$discovered" xhttp_path)"
-    resolve_path SUB_PATH "Секретный путь подписки" "$(json_get "$discovered" sub_path)"
-    resolve_path PANEL_PATH "Секретный путь панели" "$(json_get "$discovered" web_base_path)"
+    xhttp_enabled && resolve_path XHTTP_PATH "$(L "Секретный путь XHTTP" "Secret XHTTP path")" "$(json_get "$discovered" xhttp_path)"
+    resolve_path SUB_PATH "$(L "Секретный путь подписки" "Secret subscription path")" "$(json_get "$discovered" sub_path)"
+    resolve_path PANEL_PATH "$(L "Секретный путь панели" "Secret panel path")" "$(json_get "$discovered" web_base_path)"
     if paths_conflict; then
-        log "Пути XHTTP, подписки и панели совпадают или вложены друг в друга."
+        log "$(L "Пути XHTTP, подписки и панели совпадают или вложены друг в друга." "XHTTP, subscription and panel paths match or are nested in each other.")"
         for key in $(xhttp_enabled && echo XHTTP_PATH) SUB_PATH PANEL_PATH; do
             CONF[$key]=""
         done
@@ -2032,11 +2142,11 @@ resolve_paths() {
 }
 
 resolve_paths_again() {
-    xhttp_enabled && resolve_path XHTTP_PATH "Секретный путь XHTTP" ""
-    resolve_path SUB_PATH "Секретный путь подписки" ""
-    resolve_path PANEL_PATH "Секретный путь панели" ""
+    xhttp_enabled && resolve_path XHTTP_PATH "$(L "Секретный путь XHTTP" "Secret XHTTP path")" ""
+    resolve_path SUB_PATH "$(L "Секретный путь подписки" "Secret subscription path")" ""
+    resolve_path PANEL_PATH "$(L "Секретный путь панели" "Secret panel path")" ""
     if paths_conflict; then
-        die "Пути XHTTP, подписки и панели совпадают или входят один в другой."
+        die "$(L "Пути XHTTP, подписки и панели совпадают или входят один в другой." "XHTTP, subscription and panel paths match or are nested in each other.")"
     fi
 }
 
@@ -2045,7 +2155,7 @@ resolve_credentials() {
     [[ -n "$(conf_get XUI_CREDENTIALS_PENDING)" ]] && return 0
     if [[ "$RECONFIGURE" -eq 1 || "$IMPORTED_NOW" -eq 1 ]]; then
         if [[ -n "$(conf_get XUI_USERNAME)" ]] || xui_has_config; then
-            ask_yes_no "Задать новый логин и пароль панели?" n || return 0
+            ask_yes_no "$(L "Задать новый логин и пароль панели?" "Set a new panel username and password?")" n || return 0
         fi
     else
         [[ -n "$(conf_get XUI_USERNAME)" ]] && return 0
@@ -2058,120 +2168,32 @@ resolve_credentials() {
         conf_set XUI_CREDENTIALS_PENDING yes
         return 0
     fi
-    ask_optional username "Логин панели (Enter — случайный)"
+    ask_optional username "$(L "Логин панели (Enter — случайный)" "Panel username (Enter — random)")"
     [[ -z "$username" ]] && username="admin$(random_string 'a-z0-9' 6)"
-    [[ "$username" =~ $USERNAME_RE ]] || die "Логин: 3–32 символа (буквы, цифры, точка, дефис, подчёркивание)."
-    ask_password password "Пароль панели"
+    [[ "$username" =~ $USERNAME_RE ]] || die "$(L "Логин: 3–32 символа (буквы, цифры, точка, дефис, подчёркивание)." "Username: 3–32 characters (letters, digits, dot, hyphen, underscore).")"
+    ask_password password "$(L "Пароль панели" "Panel password")"
     conf_set XUI_USERNAME "$username"
     conf_set XUI_PASSWORD "$password"
     conf_unset XUI_PASSWORD_HASH
     conf_set XUI_CREDENTIALS_PENDING yes
 }
 
-# ПОРТ HYSTERIA2
-
-hy2_port_invalid() {
-    local port="$1" own="$2" p
-    if [[ ! "$port" =~ ^[0-9]{1,5}$ ]]; then
-        echo "нужен номер порта"
-        return 0
-    fi
-    port=$((10#$port))
-    if ((port < 1 || port > 65535)); then
-        echo "допустимо 1–65535"
-        return 0
-    fi
-    for p in "${HY2_FORBIDDEN_PORTS[@]}"; do
-        if ((port == p)); then
-            echo "${port} — порт по умолчанию другого VPN-протокола"
-            return 0
-        fi
-    done
-    if ((port < 1024 && port != 443)); then
-        echo "порты 1–1023 запрещены, кроме 443"
-        return 0
-    fi
-    for p in "${INTERNAL_PORTS[@]}" "$(xhttp_port)" $(ssh_ports); do
-        if ((port == p)); then
-            echo "порт ${port} занят службой сервера"
-            return 0
-        fi
-    done
-    if [[ "$port" != "$own" ]] && udp_listening "$port"; then
-        echo "UDP/${port} уже занят"
-        return 0
-    fi
-    return 1
-}
-
-random_hy2_port() {
-    local own="$1" port i
-    for ((i = 0; i < 50; i++)); do
-        port=$(shuf -i "${HY2_RANDOM_MIN}-${HY2_RANDOM_MAX}" -n 1)
-        hy2_port_invalid "$port" "$own" > /dev/null || {
-            printf '%s' "$port"
-            return 0
-        }
-    done
-    return 1
-}
-
-ask_hy2_port() {
-    local -n _hy2_out="$1"
-    local _hy2_own="$2" _hy2_value _hy2_reason
-    while true; do
-        prompted
-        read -r -p "Порт Hysteria2 (UDP) (Enter — ${HY2_DEFAULT_PORT}, r — случайный ${HY2_RANDOM_MIN}–${HY2_RANDOM_MAX}): " _hy2_value || die "Ввод прерван."
-        _hy2_value="${_hy2_value:-$HY2_DEFAULT_PORT}"
-        if [[ "${_hy2_value,,}" == r ]]; then
-            _hy2_value=$(random_hy2_port "$_hy2_own") || die "Не удалось подобрать свободный порт."
-            echo "  Выбран порт ${_hy2_value}."
-        fi
-        if _hy2_reason=$(hy2_port_invalid "$_hy2_value" "$_hy2_own"); then
-            echo "  Не подходит: ${_hy2_reason}."
-            continue
-        fi
-        _hy2_out=$((10#$_hy2_value))
-        return 0
-    done
-}
+# HYSTERIA2
 
 resolve_hy2() {
-    local current port reason
-    current=$(json_get "$(xui_discover)" hy2_port)
-    if [[ "$RECONFIGURE" -eq 0 ]]; then
-        case "$(conf_get HY2)" in
-            yes) [[ -n "$(conf_get HY2_PORT)" ]] && return 0 ;;
-            no) [[ -z "$current" ]] && return 0 ;;
-        esac
-    fi
-    if [[ -n "$current" ]]; then
-        if ask_yes_no "Hysteria2 сейчас на UDP/${current}. Оставить этот порт?" y; then
-            if reason=$(hy2_port_invalid "$current" "$current"); then
-                echo "  UDP/${current} не подходит: ${reason}."
-                ask_hy2_port port "$current"
-            else
-                port="$current"
-            fi
-        else
-            ask_hy2_port port "$current"
-        fi
-        conf_set HY2 yes
-        conf_set HY2_PORT "$port"
+    if [[ -n "$(json_get "$(xui_discover)" hy2_port)" ]]; then
+        [[ "$(conf_get HY2)" == yes ]] || conf_set HY2 yes
         return 0
     fi
+    [[ -n "$(conf_get HY2)" && "$RECONFIGURE" -eq 0 ]] && return 0
     if recommended; then
         conf_set HY2 no
-        conf_unset HY2_PORT
         return 0
     fi
-    if ask_yes_no "Добавить Hysteria2 (UDP)?" y; then
-        ask_hy2_port port ""
+    if ask_yes_no "$(L "Добавить Hysteria2 (UDP/${HY2_PORT})?" "Add Hysteria2 (UDP/${HY2_PORT})?")" y; then
         conf_set HY2 yes
-        conf_set HY2_PORT "$port"
     else
         conf_set HY2 no
-        conf_unset HY2_PORT
     fi
 }
 
@@ -2184,7 +2206,7 @@ resolve_client_name() {
         return 0
     fi
     name=$(conf_get CLIENT_NAME)
-    ask name "Имя первого клиента" "${name:-client1}" "$NAME_RE" "Разрешены буквы, цифры, дефис и подчёркивание."
+    ask name "$(L "Имя первого клиента" "First client name")" "${name:-client1}" "$NAME_RE" "$(L "Разрешены буквы, цифры, дефис и подчёркивание." "Letters, digits, hyphen and underscore are allowed.")"
     conf_set CLIENT_NAME "$name"
 }
 
@@ -2265,50 +2287,50 @@ ufw_active() {
 check_http() {
     local rc=0 code addr
     if ! command -v nginx > /dev/null 2>&1; then
-        mismatch "nginx не установлен"
+        mismatch "$(L "nginx не установлен" "nginx is not installed")"
         return 1
     fi
     render_nginx_http_reject | cmp -s - "$NGINX_HTTP_REJECT_CONF" || {
-        template_differs "антискан ${HTTP_PORT}/tcp" "$NGINX_HTTP_REJECT_CONF"
+        template_differs "$(L "антискан ${HTTP_PORT}/tcp" "anti-scan ${HTTP_PORT}/tcp")" "$NGINX_HTTP_REJECT_CONF"
         rc=1
     }
     render_nginx_http_site | cmp -s - "$(nginx_http_site_file)" || {
-        template_differs "сайт на ${HTTP_PORT}" "$(nginx_http_site_file)"
+        template_differs "$(L "сайт на ${HTTP_PORT}" "site on ${HTTP_PORT}")" "$(nginx_http_site_file)"
         rc=1
     }
     [[ -e "${NGINX_SITES_ENABLED}/default" ]] && {
-        mismatch "подключён сайт default"
+        mismatch "$(L "подключён сайт default" "the default site is enabled")"
         rc=1
     }
     [[ -n "$(nginx_stale_http_sites)" ]] && {
-        mismatch "лишний сайт на ${HTTP_PORT}: $(nginx_stale_http_sites | tr '\n' ' ')"
+        mismatch "$(L "лишний сайт на ${HTTP_PORT}: $(nginx_stale_http_sites | tr '\n' ' ')" "extra site on ${HTTP_PORT}: $(nginx_stale_http_sites | tr '\n' ' ')")"
         rc=1
     }
     [[ -d "$(acme_challenge_dir)" ]] || {
-        mismatch "нет каталога $(acme_challenge_dir)"
+        mismatch "$(L "нет каталога $(acme_challenge_dir)" "no directory $(acme_challenge_dir)")"
         rc=1
     }
     if ! systemctl is-active --quiet nginx; then
-        mismatch "nginx не запущен"
+        mismatch "$(L "nginx не запущен" "nginx is not running")"
         return 1
     fi
     while IFS= read -r addr; do
         nginx_addresses | grep -qxF "$addr" || {
-            mismatch "nginx не слушает ${addr}"
+            mismatch "$(L "nginx не слушает ${addr}" "nginx does not listen on ${addr}")"
             rc=1
         }
     done < <(nginx_http_addresses)
     challenge_served 127.0.0.1 || {
-        mismatch "http://$(conf_get DOMAIN)/.well-known/acme-challenge/ не отдаёт файлы из $(acme_challenge_dir)"
+        mismatch "$(L "http://$(conf_get DOMAIN)/.well-known/acme-challenge/ не отдаёт файлы из $(acme_challenge_dir)" "http://$(conf_get DOMAIN)/.well-known/acme-challenge/ does not serve files from $(acme_challenge_dir)")"
         rc=1
     }
     code=$(curl_exit_code "http://127.0.0.1/")
     [[ "$code" == 52 ]] || {
-        mismatch "http://127.0.0.1/: curl exit ${code}, ожидался 52 (закрытие без ответа)"
+        mismatch "$(L "http://127.0.0.1/: curl exit ${code}, ожидался 52 (закрытие без ответа)" "http://127.0.0.1/: curl exit ${code}, expected 52 (closed without a response)")"
         rc=1
     }
     if ufw_active && ! ufw_allows "${HTTP_PORT}/tcp"; then
-        mismatch "нет правила ufw ${HTTP_PORT}/tcp"
+        mismatch "$(L "нет правила ufw ${HTTP_PORT}/tcp" "no ufw rule ${HTTP_PORT}/tcp")"
         rc=1
     fi
     return "$rc"
@@ -2319,7 +2341,7 @@ nginx_write_http_files() {
     dir=$(acme_challenge_dir)
     rm -f "${NGINX_SITES_ENABLED}/default"
     while IFS= read -r f; do
-        [[ -n "$f" ]] && rm -f "$f" && log "удалён ${f}"
+        [[ -n "$f" ]] && rm -f "$f" && log "$(L "удалён ${f}" "removed ${f}")"
     done < <(nginx_stale_http_sites)
     mkdir -p "$dir" && chmod 755 "$ACME_WEBROOT" "${ACME_WEBROOT}/.well-known" "$dir"
     render_nginx_http_reject > "$NGINX_HTTP_REJECT_CONF"
@@ -2330,7 +2352,7 @@ apply_http() {
     local others foreign stale
     others=$(tcp_listeners "$HTTP_PORT" | grep -v '"nginx"')
     if [[ -n "$others" ]]; then
-        log "Порт ${HTTP_PORT}/tcp занят другим процессом:"
+        log "$(L "Порт ${HTTP_PORT}/tcp занят другим процессом:" "Port ${HTTP_PORT}/tcp is used by another process:")"
         log_lines "  " <<< "$others"
         return 1
     fi
@@ -2338,13 +2360,13 @@ apply_http() {
     mapfile -t stale < <(nginx_stale_http_sites)
     foreign=$(nginx_foreign_listeners "$HTTP_PORT" "$NGINX_HTTP_REJECT_CONF" "$(nginx_http_site_file)" "${stale[@]}")
     if [[ -n "$foreign" ]]; then
-        log "Порт ${HTTP_PORT} заняли другие конфиги nginx:"
+        log "$(L "Порт ${HTTP_PORT} заняли другие конфиги nginx:" "Port ${HTTP_PORT} is taken by other nginx configs:")"
         log_lines "  " <<< "$foreign"
         return 1
     fi
     nginx_apply nginx_write_http_files nginx_listens_http || return 1
     if ufw_present && ! ufw_allows "${HTTP_PORT}/tcp"; then
-        ufw allow "${HTTP_PORT}/tcp" comment "$SCRIPT_NAME" > /dev/null 2>&1 && log "ufw: добавлено ${HTTP_PORT}/tcp"
+        ufw allow "${HTTP_PORT}/tcp" comment "$SCRIPT_NAME" > /dev/null 2>&1 && log "$(L "ufw: добавлено ${HTTP_PORT}/tcp" "ufw: added ${HTTP_PORT}/tcp")"
     fi
     return 0
 }
@@ -2380,17 +2402,17 @@ acme_set_webroot() {
     local conf backup
     conf=$(acme_domain_conf)
     if ! grep -q '^Le_Webroot=' "$conf" 2> /dev/null; then
-        log "Нет строки Le_Webroot в ${conf}"
+        log "$(L "Нет строки Le_Webroot в ${conf}" "No Le_Webroot line in ${conf}")"
         return 1
     fi
     backup="${conf}.bak-$(date +%F-%H%M%S)"
     cp -p "$conf" "$backup" || return 1
     sed -i "s|^Le_Webroot=.*|Le_Webroot='${ACME_WEBROOT}'|" "$conf"
     if ! acme_webroot_set; then
-        log "Не удалось записать Le_Webroot='${ACME_WEBROOT}' в ${conf}"
+        log "$(L "Не удалось записать Le_Webroot='${ACME_WEBROOT}' в ${conf}" "Failed to write Le_Webroot='${ACME_WEBROOT}' to ${conf}")"
         return 1
     fi
-    log "acme.sh: Le_Webroot='${ACME_WEBROOT}' в ${conf}, копия: ${backup}"
+    log "$(L "acme.sh: Le_Webroot='${ACME_WEBROOT}' в ${conf}, копия: ${backup}" "acme.sh: Le_Webroot='${ACME_WEBROOT}' in ${conf}, backup: ${backup}")"
 }
 
 render_cert_renew() {
@@ -2429,23 +2451,23 @@ acme_cron_present() {
 check_cert() {
     local rc=0
     if ! cert_valid "$(conf_get DOMAIN)" "$(cert_dir)"; then
-        mismatch "сертификат $(cert_dir)/fullchain.pem для $(conf_get DOMAIN) отсутствует, истекает в течение 30 дней или не совпадает с ключом"
+        mismatch "$(L "сертификат $(cert_dir)/fullchain.pem для $(conf_get DOMAIN) отсутствует, истекает в течение 30 дней или не совпадает с ключом" "certificate $(cert_dir)/fullchain.pem for $(conf_get DOMAIN) is missing, expires within 30 days or does not match the key")"
         rc=1
     fi
     acme_webroot_set || {
-        mismatch "acme.sh не в режиме webroot: нет строки Le_Webroot='${ACME_WEBROOT}' в $(acme_domain_conf)"
+        mismatch "$(L "acme.sh не в режиме webroot: нет строки Le_Webroot='${ACME_WEBROOT}' в $(acme_domain_conf)" "acme.sh is not in webroot mode: no Le_Webroot='${ACME_WEBROOT}' line in $(acme_domain_conf)")"
         rc=1
     }
     render_cert_renew | cmp -s - "$CERT_RENEW" || {
-        template_differs "скрипт продления" "$CERT_RENEW"
+        template_differs "$(L "скрипт продления" "renewal script")" "$CERT_RENEW"
         rc=1
     }
     renew_cron_present || {
-        mismatch "нет задачи cron для ${CERT_RENEW}"
+        mismatch "$(L "нет задачи cron для ${CERT_RENEW}" "no cron job for ${CERT_RENEW}")"
         rc=1
     }
     acme_cron_present && {
-        mismatch "в cron есть задача acme.sh (продление идёт через ${CERT_RENEW})"
+        mismatch "$(L "в cron есть задача acme.sh (продление идёт через ${CERT_RENEW})" "cron has an acme.sh job (renewal goes through ${CERT_RENEW})")"
         rc=1
     }
     return "$rc"
@@ -2465,38 +2487,38 @@ issue_cert() {
     domain=$(conf_get DOMAIN)
     dir=$(cert_dir)
     if [[ ! -x "$ACME" ]]; then
-        log "Установка acme.sh"
+        log "$(L "Установка acme.sh" "Installing acme.sh")"
         curl -fsSL https://get.acme.sh | sh -s email="$(conf_get ACME_EMAIL)" >> "$LOG_FILE" 2>&1
         [[ -x "$ACME" ]] || {
-            log "Не удалось установить acme.sh"
+            log "$(L "Не удалось установить acme.sh" "Failed to install acme.sh")"
             return 1
         }
     fi
     "$ACME" --set-default-ca --server letsencrypt >> "$LOG_FILE" 2>&1 || true
     for attempt in 1 2; do
-        log "Выпуск сертификата для ${domain} (HTTP-01, webroot ${ACME_WEBROOT})"
+        log "$(L "Выпуск сертификата для ${domain} (HTTP-01, webroot ${ACME_WEBROOT})" "Issuing a certificate for ${domain} (HTTP-01, webroot ${ACME_WEBROOT})")"
         "$ACME" --issue -d "$domain" --keylength ec-256 -w "$ACME_WEBROOT" >> "$LOG_FILE" 2>&1
         rc=$?
         [[ "$rc" -eq 0 || "$rc" -eq 2 ]] && break
         if [[ "$attempt" -eq 1 ]]; then
-            log "acme.sh завершился с кодом ${rc}, повторная попытка через 10 с"
+            log "$(L "acme.sh завершился с кодом ${rc}, повторная попытка через 10 с" "acme.sh exited with code ${rc}, retrying in 10 s")"
             sleep 10
         fi
     done
     if [[ "$rc" -ne 0 && "$rc" -ne 2 ]]; then
-        log "acme.sh не выпустил сертификат, код ${rc}. Возможные причины: A-запись домена указывает не на этот сервер, ${HTTP_PORT}/tcp закрыт снаружи"
+        log "$(L "acme.sh не выпустил сертификат, код ${rc}. Возможные причины: A-запись домена указывает не на этот сервер, ${HTTP_PORT}/tcp закрыт снаружи" "acme.sh did not issue the certificate, code ${rc}. Possible causes: the domain's A record does not point to this server, ${HTTP_PORT}/tcp is closed from the outside")"
         return 1
     fi
     acme_webroot_set || acme_set_webroot || return 1
     acme_install_cert "$domain" "$dir"
     if ! cert_valid "$domain" "$dir" && [[ "$rc" -eq 2 ]]; then
-        log "Сертификат acme.sh не подходит, перевыпуск"
+        log "$(L "Сертификат acme.sh не подходит, перевыпуск" "The acme.sh certificate is not suitable, reissuing")"
         "$ACME" --renew -d "$domain" --ecc --force >> "$LOG_FILE" 2>&1
         acme_install_cert "$domain" "$dir"
     fi
     chmod 600 "${dir}/privkey.pem" 2> /dev/null
     cert_valid "$domain" "$dir" || {
-        log "Сертификат не установлен в ${dir}"
+        log "$(L "Сертификат не установлен в ${dir}" "The certificate is not installed in ${dir}")"
         return 1
     }
 }
@@ -2513,11 +2535,11 @@ apply_cert() {
         crontab -l -u root 2> /dev/null | grep -vF "$CERT_RENEW" | grep -v 'acme.sh --cron'
         echo "17 3 * * * ${CERT_RENEW}"
     } | crontab -u root - || {
-        log "Не удалось записать задачу cron"
+        log "$(L "Не удалось записать задачу cron" "Failed to write the cron job")"
         return 1
     }
     "$CERT_RENEW" >> "$LOG_FILE" 2>&1
-    log "Автопродление: ${CERT_RENEW}, cron root, ежедневно в 03:17"
+    log "$(L "Автопродление: ${CERT_RENEW}, cron root, ежедневно в 03:17" "Auto-renewal: ${CERT_RENEW}, root cron, daily at 03:17")"
 }
 
 # УСТАНОВКА 3X-UI И ПЕРЕНОС БАЗЫ
@@ -2525,24 +2547,24 @@ apply_cert() {
 check_xui() {
     local rc=0 version
     if [[ ! -x "$XUI_BIN" ]]; then
-        mismatch "3x-ui не установлен"
+        mismatch "$(L "3x-ui не установлен" "3x-ui is not installed")"
         return 1
     fi
     version="v$("$XUI_BIN" -v 2> /dev/null)"
     log "3x-ui ${version}"
     if [[ "$version" != "$XUI_SUPPORTED_VERSION" ]]; then
-        warn_lines <<< "3x-ui ${version}: со скриптом проверена ${XUI_SUPPORTED_VERSION}"
+        warn_lines <<< "$(L "3x-ui ${version}: со скриптом проверена ${XUI_SUPPORTED_VERSION}" "3x-ui ${version}: the script is tested with ${XUI_SUPPORTED_VERSION}")"
     fi
     [[ -n "$IMPORT_DB" ]] && {
-        mismatch "ожидается перенос базы ${IMPORT_DB}"
+        mismatch "$(L "ожидается перенос базы ${IMPORT_DB}" "database move ${IMPORT_DB} is pending")"
         rc=1
     }
     xray_bin > /dev/null || {
-        mismatch "xray-core не найден"
+        mismatch "$(L "xray-core не найден" "xray-core not found")"
         rc=1
     }
     systemctl is-active --quiet x-ui || {
-        mismatch "служба x-ui не запущена"
+        mismatch "$(L "служба x-ui не запущена" "the x-ui service is not running")"
         rc=1
     }
     return "$rc"
@@ -2559,21 +2581,21 @@ resolve_xui_version() {
     [[ -x "$XUI_BIN" ]] && return 0
     latest=$(xui_latest_version)
     if [[ ! "$latest" =~ ^v[0-9]+(\.[0-9]+)*$ ]]; then
-        log_quiet "Последняя версия 3x-ui не получена из GitHub API, выбрана ${XUI_SUPPORTED_VERSION}."
+        log_quiet "$(L "Последняя версия 3x-ui не получена из GitHub API, выбрана ${XUI_SUPPORTED_VERSION}." "The latest 3x-ui version was not received from the GitHub API, ${XUI_SUPPORTED_VERSION} selected.")"
         return 0
     fi
     version_ge "${XUI_SUPPORTED_VERSION#v}" "${latest#v}" && return 0
     recommended && return 0
     if [[ ! -t 0 ]]; then
-        log_quiet "Последняя версия 3x-ui ${latest}, ввод не с терминала, выбрана ${XUI_SUPPORTED_VERSION}."
+        log_quiet "$(L "Последняя версия 3x-ui ${latest}, ввод не с терминала, выбрана ${XUI_SUPPORTED_VERSION}." "The latest 3x-ui version is ${latest}, input is not from a terminal, ${XUI_SUPPORTED_VERSION} selected.")"
         return 0
     fi
-    echo "Версия 3x-ui:"
-    echo "  1 — ${XUI_SUPPORTED_VERSION}, проверена со скриптом"
-    echo "  2 — ${latest}, последняя, со скриптом не проверена"
+    printf '%s\n' "$(L "Версия 3x-ui:" "3x-ui version:")"
+    printf '%s\n' "$(L "  1 — ${XUI_SUPPORTED_VERSION}, проверена со скриптом" "  1 — ${XUI_SUPPORTED_VERSION}, tested with the script")"
+    printf '%s\n' "$(L "  2 — ${latest}, последняя, со скриптом не проверена" "  2 — ${latest}, the latest, not tested with the script")"
     while true; do
         prompted
-        read -r -p "Выбор (Enter — 1): " choice || die "Ввод прерван."
+        read -r -p "$(L "Выбор (Enter — 1): " "Choice (Enter — 1): ")" choice || die "$(L "Ввод прерван." "Input interrupted.")"
         case "${choice:-1}" in
             1) return 0 ;;
             2)
@@ -2581,23 +2603,23 @@ resolve_xui_version() {
                 return 0
                 ;;
         esac
-        echo "  Ожидается 1 или 2."
+        printf '%s\n' "$(L "  Ожидается 1 или 2." "  Expected 1 or 2.")"
     done
 }
 
 install_xui() {
     local installer version="${XUI_VERSION:-$XUI_SUPPORTED_VERSION}"
-    log "Установка 3x-ui ${version} (1–3 минуты)"
+    log "$(L "Установка 3x-ui ${version} (1–3 минуты)" "Installing 3x-ui ${version} (1–3 minutes)")"
     installer=$(mktemp)
     if ! curl -fsSL "https://raw.githubusercontent.com/${XUI_REPO}/${version}/install.sh" -o "$installer"; then
         rm -f "$installer"
-        log "Не удалось скачать установщик 3x-ui ${version}"
+        log "$(L "Не удалось скачать установщик 3x-ui ${version}" "Failed to download the 3x-ui installer ${version}")"
         return 1
     fi
     bash "$installer" "$version" < /dev/null >> "$LOG_FILE" 2>&1
     rm -f "$installer"
     [[ -x "$XUI_BIN" ]] || {
-        log "Установка 3x-ui завершилась с ошибкой"
+        log "$(L "Установка 3x-ui завершилась с ошибкой" "3x-ui installation failed")"
         return 1
     }
 }
@@ -2605,7 +2627,7 @@ install_xui() {
 import_db() {
     local src="$1" work report bin newer
     bin=$(xray_bin) || {
-        log "xray-core не найден"
+        log "$(L "xray-core не найден" "xray-core not found")"
         return 1
     }
     work=$(mktemp -d)
@@ -2618,14 +2640,14 @@ import_db() {
     newer=$(py db-newer "${work}/x-ui.db" "$XUI_DB" 2>&1)
     if [[ -n "$newer" ]]; then
         rm -rf "$work"
-        log "База ${src} создана более новой версией 3x-ui, чем установленная v$("$XUI_BIN" -v 2> /dev/null):"
+        log "$(L "База ${src} создана более новой версией 3x-ui, чем установленная v$("$XUI_BIN" -v 2> /dev/null):" "Database ${src} was created by a newer 3x-ui version than the installed v$("$XUI_BIN" -v 2> /dev/null):")"
         log_lines "  " <<< "$newer"
-        log "Требуется 3x-ui той же версии, что на исходном сервере, или новее"
+        log "$(L "Требуется 3x-ui той же версии, что на исходном сервере, или новее" "3x-ui of the same version as on the source server or newer is required")"
         return 1
     fi
     if ! report=$(py import-prepare "${work}/x-ui.db" "$bin" "$(conf_get DOMAIN)" "$REALITY_TARGET"); then
         rm -rf "$work"
-        log "Не удалось подготовить базу: ${report}"
+        log "$(L "Не удалось подготовить базу: ${report}" "Failed to prepare the database: ${report}")"
         return 1
     fi
     xui_stop
@@ -2633,19 +2655,19 @@ import_db() {
     mkdir -p "$(dirname "$XUI_DB")"
     if ! cp "${work}/x-ui.db" "$XUI_DB"; then
         rm -rf "$work"
-        log "Не удалось записать ${XUI_DB}"
+        log "$(L "Не удалось записать ${XUI_DB}" "Failed to write ${XUI_DB}")"
         return 1
     fi
     rm -f "${XUI_DB}-wal" "${XUI_DB}-shm"
     rm -rf "$work"
     [[ "$(json_get "$report" twofa_reset)" == true ]] && TWO_FA_RESET=1
     conf_unset XHTTP XHTTP_PORT XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH XUI_CREDENTIALS_PENDING \
-        HY2 HY2_PORT CLIENT_NAME
+        HY2 CLIENT_NAME
     IMPORTED_NOW=1
-    log "База перенесена из ${src}"
-    [[ "$(json_get "$report" kept)" != "[]" ]] && log "Ключи Reality сохранены: $(json_get "$report" kept)"
-    [[ "$(json_get "$report" rekeyed)" != "[]" ]] && log "Ключи Reality выпущены заново: $(json_get "$report" rekeyed)"
-    [[ "$TWO_FA_RESET" -eq 1 ]] && log "2FA из базы отключена"
+    log "$(L "База перенесена из ${src}" "Database moved from ${src}")"
+    [[ "$(json_get "$report" kept)" != "[]" ]] && log "$(L "Ключи Reality сохранены: $(json_get "$report" kept)" "Reality keys kept: $(json_get "$report" kept)")"
+    [[ "$(json_get "$report" rekeyed)" != "[]" ]] && log "$(L "Ключи Reality выпущены заново: $(json_get "$report" rekeyed)" "Reality keys reissued: $(json_get "$report" rekeyed)")"
+    [[ "$TWO_FA_RESET" -eq 1 ]] && log "$(L "2FA из базы отключена" "2FA from the database is disabled")"
     xui_start
 }
 
@@ -2722,6 +2744,7 @@ render_nginx_site() {
     folder=$(conf_get CERT_FOLDER)
     printf 'server {\n'
     nginx_listen_lines ""
+    [[ "$(hy2_port_answer)" != 0 ]] && printf '%s\n' "$ALT_SVC_LINE"
     cat << EOF
 
     server_name ${domain};
@@ -2818,11 +2841,11 @@ nginx_remove_stale_rejects() {
         [[ -n "$f" ]] || continue
         if [[ -L "$f" ]]; then
             rm -f "$f"
-            log "отключён устаревший антискан ${f}"
+            log "$(L "отключён устаревший антискан ${f}" "disabled the outdated anti-scan ${f}")"
             continue
         fi
         backup="/root/$(basename "$f").bak-$(date +%F-%H%M%S)"
-        mv "$f" "$backup" && log "устаревший антискан ${f} перенесён в ${backup}"
+        mv "$f" "$backup" && log "$(L "устаревший антискан ${f} перенесён в ${backup}" "outdated anti-scan ${f} moved to ${backup}")"
     done < <(nginx_stale_rejects)
 }
 
@@ -2838,10 +2861,10 @@ prepare_stub_site() {
     stub_ready && return 0
     mkdir -p "$dir"
     if [[ ! -s "${dir}/index.html" ]] && ! recommended; then
-        echo "${INDENT}Папка сайта-заглушки: ${dir}"
-        echo "${INDENT}Можно положить туда index.html и фавиконку (favicon.ico, .svg или .png)."
+        printf '%s\n' "$(L "${INDENT}Папка сайта-заглушки: ${dir}" "${INDENT}Decoy site folder: ${dir}")"
+        printf '%s\n' "$(L "${INDENT}Можно положить туда index.html и фавиконку (favicon.ico, .svg или .png)." "${INDENT}index.html and a favicon (favicon.ico, .svg or .png) can be placed there.")"
         prompted
-        read -r -p "${INDENT}Enter — продолжить: " || die "Ввод прерван."
+        read -r -p "$(L "${INDENT}Enter — продолжить: " "${INDENT}Enter — continue: ")" || die "$(L "Ввод прерван." "Input interrupted.")"
     fi
     for candidate in favicon.ico favicon.svg favicon.png; do
         if [[ -s "${dir}/${candidate}" ]]; then
@@ -2854,7 +2877,7 @@ prepare_stub_site() {
         base64 -d > "${dir}/favicon.ico" << 'B64EOF'
 AAABAAIAEBAAAAAAIAAtAQAAJgAAACAgAAAAACAApQAAAFMBAACJUE5HDQoaCgAAAA1JSERSAAAAEAAAABAIBgAAAB/z/2EAAAD0SURBVHic7ZMxTsNAEEX/zO46WPGZaAM0uYVBaVAOgCLEARANSnKLVJCWMzk4eHb3U6SIIkVGVlq+NOV7+lN8qetVWK/v7eHx6XY8rq5/2n0i6HAmAkmj8srtds3X8u3lo65XQQBgNl/chFBsfAgFcz7HHiWqiGadWTd9f33+lNl8cedd2BDZ5ZwiKdIrEFLVeYGmmGzqRWQSiuDb9ttEJPTjh0dSSlaWo5D2caIgGjIT+Bs97ZEJolEAOgw+SgCoDgdP8y84CDJADkdJAFkhqERUhklIERUIKiW5tc6ic84DNBKx7wCac85bZ5Hk9vIxXTrnX31kpEilEQNGAAAAAElFTkSuQmCCiVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAbElEQVR4nO3XsQ0AIQwDwLzXpfsJmOA75oWK4hMQVUxjl4DwSaTB7HKe1WJ5a88oa18NfWCV7+7G6UA2ArsNFgLsco8IM8COAAIIIIAAAggggAACwGz9Y8nO7IRfYJb/ACyE7wgzkIm48dTHDMFSJDwZtkmoAAAAAElFTkSuQmCC
 B64EOF
-        log "фавиконка не найдена, установлена стандартная"
+        log "$(L "фавиконка не найдена, установлена стандартная" "favicon not found, the default one is installed")"
     fi
     if [[ ! -s "${dir}/index.html" ]]; then
         cat > "${dir}/index.html" << EOF
@@ -2871,17 +2894,17 @@ B64EOF
 </body>
 </html>
 EOF
-        log "index.html не найден, установлена страница 403 Forbidden"
+        log "$(L "index.html не найден, установлена страница 403 Forbidden" "index.html not found, a 403 Forbidden page is installed")"
     fi
     stub_ready
 }
 
 install_nginx() {
     command -v nginx > /dev/null 2>&1 && return 0
-    log "Установка nginx"
+    log "$(L "Установка nginx" "Installing nginx")"
     export DEBIAN_FRONTEND=noninteractive
     if ! apt-get update -qq >> "$LOG_FILE" 2>&1 || ! apt-get install -y -qq nginx >> "$LOG_FILE" 2>&1; then
-        log "Не удалось установить nginx"
+        log "$(L "Не удалось установить nginx" "Failed to install nginx")"
         return 1
     fi
 }
@@ -2890,7 +2913,7 @@ nginx_backup_once() {
     [[ -n "$NGINX_BACKUP" || ! -d /etc/nginx ]] && return 0
     NGINX_BACKUP="/root/nginx-$(date +%F-%H%M%S).tgz"
     tar czf "$NGINX_BACKUP" -C / etc/nginx 2> /dev/null || NGINX_BACKUP=""
-    [[ -n "$NGINX_BACKUP" ]] && log "Резервная копия /etc/nginx: ${NGINX_BACKUP}"
+    [[ -n "$NGINX_BACKUP" ]] && log "$(L "Резервная копия /etc/nginx: ${NGINX_BACKUP}" "/etc/nginx backup: ${NGINX_BACKUP}")"
 }
 
 nginx_reload() {
@@ -2917,7 +2940,7 @@ nginx_apply() {
     mkdir -p "$NGINX_SITES_AVAILABLE" "$NGINX_SITES_ENABLED" "$NGINX_CONF_D"
     "$writer"
     if ! nginx -t >> "$LOG_FILE" 2>&1; then
-        log "nginx -t: ошибка конфигурации, изменения отменены:"
+        log "$(L "nginx -t: ошибка конфигурации, изменения отменены:" "nginx -t: configuration error, changes reverted:")"
         nginx -t 2>&1 | tail -n 5 | log_lines "  "
         while IFS= read -r f; do
             [[ -n "${existed[$f]:-}" ]] || rm -f "$f"
@@ -2928,14 +2951,14 @@ nginx_apply() {
     fi
     rm -f "$snapshot"
     if ! nginx_reload; then
-        log "nginx не перезагрузился, журнал nginx записан в ${LOG_FILE}"
+        log "$(L "nginx не перезагрузился, журнал nginx записан в ${LOG_FILE}" "nginx did not reload, the nginx journal is saved to ${LOG_FILE}")"
         journal_tail nginx
         return 1
     fi
     if ! wait_for 15 "$listening"; then
         systemctl restart nginx > /dev/null 2>&1
         if ! wait_for 10 "$listening"; then
-            log "nginx слушает: $(nginx_addresses | tr '\n' ' ')ожидается: $(nginx_expected_text); адреса задают другие конфиги в ${NGINX_SITES_ENABLED} или ${NGINX_CONF_D}"
+            log "$(L "nginx слушает: $(nginx_addresses | tr '\n' ' ')ожидается: $(nginx_expected_text); адреса задают другие конфиги в ${NGINX_SITES_ENABLED} или ${NGINX_CONF_D}" "nginx listens on: $(nginx_addresses | tr '\n' ' ')expected: $(nginx_expected_text); the addresses come from other configs in ${NGINX_SITES_ENABLED} or ${NGINX_CONF_D}")"
             return 1
         fi
     fi
@@ -2955,54 +2978,62 @@ nginx_write_config() {
     nginx_apply nginx_write_tls_files nginx_listens_expected
 }
 
+alt_svc_count() {
+    grep -ciE '^[[:space:]]*add_header[[:space:]]+Alt-Svc[[:space:]]' "$1" 2> /dev/null
+}
+
 check_nginx() {
     local rc=0 site addr expected has_local=0
     if ! command -v nginx > /dev/null 2>&1; then
-        mismatch "nginx не установлен"
+        mismatch "$(L "nginx не установлен" "nginx is not installed")"
         return 1
     fi
     site=$(nginx_site_file)
     render_nginx_site | cmp -s - "$site" || {
-        template_differs "конфигурация сайта" "$site"
+        template_differs "$(L "конфигурация сайта" "site configuration")" "$site"
         rc=1
     }
+    if [[ -e "$site" ]] && [[ "$(alt_svc_count "$site")" != "$([[ "$(hy2_port_answer)" != 0 ]] && echo 1 || echo 0)" ]]; then
+        mismatch "$(L "Alt-Svc в ${site}: строк $(alt_svc_count "$site"), нужно $([[ "$(hy2_port_answer)" != 0 ]] && echo 1 || echo 0)" "Alt-Svc in ${site}: $(alt_svc_count "$site") lines, expected $([[ "$(hy2_port_answer)" != 0 ]] && echo 1 || echo 0)")"
+        rc=1
+    fi
     [[ "$(readlink -f "$(nginx_site_link)")" == "$site" ]] || {
-        mismatch_minor "сайт ${site} не подключён в ${NGINX_SITES_ENABLED}"
+        mismatch_minor "$(L "сайт ${site} не подключён в ${NGINX_SITES_ENABLED}" "site ${site} is not enabled in ${NGINX_SITES_ENABLED}")"
         rc=1
     }
     render_nginx_reject | cmp -s - "$NGINX_REJECT_CONF" || {
-        template_differs "антискан" "$NGINX_REJECT_CONF"
+        template_differs "$(L "антискан" "anti-scan")" "$NGINX_REJECT_CONF"
         rc=1
     }
     [[ -n "$(nginx_stale_rejects)" ]] && {
-        mismatch "устаревший антискан на ${REALITY_TARGET}: $(nginx_stale_rejects | tr '\n' ' ')"
+        mismatch "$(L "устаревший антискан на ${REALITY_TARGET}: $(nginx_stale_rejects | tr '\n' ' ')" "outdated anti-scan on ${REALITY_TARGET}: $(nginx_stale_rejects | tr '\n' ' ')")"
         rc=1
     }
     [[ -e "${NGINX_SITES_ENABLED}/default" ]] && {
-        mismatch "подключён сайт default"
+        mismatch "$(L "подключён сайт default" "the default site is enabled")"
         rc=1
     }
     stub_ready || {
-        mismatch_minor "нет сайта-заглушки в $(www_dir)"
+        mismatch_minor "$(L "нет сайта-заглушки в $(www_dir)" "no decoy site in $(www_dir)")"
         rc=1
     }
     if ! systemctl is-active --quiet nginx; then
-        mismatch "nginx не запущен"
+        mismatch "$(L "nginx не запущен" "nginx is not running")"
         return 1
     fi
     expected=" $(nginx_expected_addresses | tr '\n' ' ') "
     while IFS= read -r addr; do
         [[ "$addr" == "$REALITY_TARGET" ]] && has_local=1
         [[ "$expected" == *" ${addr} "* ]] && continue
-        mismatch "nginx слушает лишний адрес ${addr}"
+        mismatch "$(L "nginx слушает лишний адрес ${addr}" "nginx listens on an extra address ${addr}")"
         rc=1
     done < <(nginx_addresses)
     [[ "$has_local" -eq 1 ]] || {
-        mismatch "nginx не слушает ${REALITY_TARGET}"
+        mismatch "$(L "nginx не слушает ${REALITY_TARGET}" "nginx does not listen on ${REALITY_TARGET}")"
         rc=1
     }
     dest_ready "$(conf_get DOMAIN)" || {
-        mismatch "${REALITY_TARGET} не годится в target Reality (нужны TLS 1.3, h2, свой сертификат, отказ без SNI)"
+        mismatch "$(L "${REALITY_TARGET} не годится в target Reality (нужны TLS 1.3, h2, свой сертификат, отказ без SNI)" "${REALITY_TARGET} is not suitable as the Reality target (TLS 1.3, h2, own certificate and rejection without SNI are required)")"
         rc=1
     }
     return "$rc"
@@ -3012,12 +3043,12 @@ apply_nginx() {
     local foreign
     install_nginx || return 1
     prepare_stub_site || {
-        log "Не удалось подготовить сайт-заглушку в $(www_dir)"
+        log "$(L "Не удалось подготовить сайт-заглушку в $(www_dir)" "Failed to prepare the decoy site in $(www_dir)")"
         return 1
     }
     foreign=$(nginx_foreign_public_listeners)
     if [[ -n "$foreign" ]]; then
-        log "Публичный порт ${PUBLIC_TLS_PORT} заняли другие конфиги nginx:"
+        log "$(L "Публичный порт ${PUBLIC_TLS_PORT} заняли другие конфиги nginx:" "Public port ${PUBLIC_TLS_PORT} is taken by other nginx configs:")"
         log_lines "  " <<< "$foreign"
         return 1
     fi
@@ -3028,7 +3059,7 @@ release_public_443() {
     local foreign
     foreign=$(nginx_foreign_public_listeners)
     if [[ -n "$foreign" ]]; then
-        log "Порт ${PUBLIC_TLS_PORT} держат другие конфиги nginx:"
+        log "$(L "Порт ${PUBLIC_TLS_PORT} держат другие конфиги nginx:" "Port ${PUBLIC_TLS_PORT} is held by other nginx configs:")"
         log_lines "  " <<< "$foreign"
         return 1
     fi
@@ -3036,7 +3067,7 @@ release_public_443() {
         nginx_write_config || return 1
     fi
     if ! wait_for 10 public_443_free; then
-        log "Порт ${PUBLIC_TLS_PORT}/tcp занят:"
+        log "$(L "Порт ${PUBLIC_TLS_PORT}/tcp занят:" "Port ${PUBLIC_TLS_PORT}/tcp is in use:")"
         tcp_listeners "$PUBLIC_TLS_PORT" | log_lines "  "
         return 1
     fi
@@ -3052,7 +3083,7 @@ panel_settings_wanted() {
 check_panel() {
     local rc=0 diff code wanted
     systemctl is-active --quiet x-ui || {
-        mismatch "x-ui не запущен"
+        mismatch "$(L "x-ui не запущен" "x-ui is not running")"
         return 1
     }
     mapfile -t wanted < <(panel_settings_wanted)
@@ -3062,24 +3093,24 @@ check_panel() {
         rc=1
     fi
     if [[ -n "$(conf_get XUI_CREDENTIALS_PENDING)" ]]; then
-        mismatch_minor "новые логин и пароль панели ещё не применены"
+        mismatch_minor "$(L "новые логин и пароль панели ещё не применены" "the new panel username and password are not applied yet")"
         rc=1
     fi
     if [[ -e "$XUI_INSTALL_RESULT" ]]; then
-        mismatch_minor "остался ${XUI_INSTALL_RESULT}"
+        mismatch_minor "$(L "остался ${XUI_INSTALL_RESULT}" "${XUI_INSTALL_RESULT} is left over")"
         rc=1
     fi
     if fresh_xui_token && [[ "$(py api-token-exists "$XUI_DB" install)" == yes ]]; then
-        mismatch_minor "остался API-токен установщика 3x-ui"
+        mismatch_minor "$(L "остался API-токен установщика 3x-ui" "the 3x-ui installer API token is left over")"
         rc=1
     fi
     tcp_listening "$NGINX_ADDR" "$PANEL_PORT" || {
-        mismatch "панель не слушает ${NGINX_ADDR}:${PANEL_PORT}"
+        mismatch "$(L "панель не слушает ${NGINX_ADDR}:${PANEL_PORT}" "the panel does not listen on ${NGINX_ADDR}:${PANEL_PORT}")"
         rc=1
     }
     code=$(http_code "https://$(conf_get DOMAIN):${NGINX_PORT}$(conf_get PANEL_PATH)/" "$(conf_get DOMAIN):${NGINX_PORT}:${NGINX_ADDR}")
     [[ "$code" =~ ^(200|301|302|307|308)$ ]] || {
-        mismatch "панель через nginx отвечает кодом ${code}"
+        mismatch "$(L "панель через nginx отвечает кодом ${code}" "the panel responds through nginx with code ${code}")"
         rc=1
     }
     return "$rc"
@@ -3097,7 +3128,7 @@ apply_panel() {
     xui_stop
     backup_db_once
     if ! "$XUI_BIN" setting "${args[@]}" >> "$LOG_FILE" 2>&1; then
-        log "x-ui setting завершился с ошибкой"
+        log "$(L "x-ui setting завершился с ошибкой" "x-ui setting failed")"
         xui_start
         return 1
     fi
@@ -3139,7 +3170,7 @@ check_subscription() {
         rc=1
     fi
     tcp_listening "$NGINX_ADDR" "$SUB_PORT" || {
-        mismatch "сервер подписки не слушает ${NGINX_ADDR}:${SUB_PORT}"
+        mismatch "$(L "сервер подписки не слушает ${NGINX_ADDR}:${SUB_PORT}" "the subscription server does not listen on ${NGINX_ADDR}:${SUB_PORT}")"
         rc=1
     }
     return "$rc"
@@ -3166,42 +3197,52 @@ inbounds_report() {
 }
 
 runtime_inbounds_ok() {
-    local summary hy2_port rc=0 quiet="${1:-0}"
+    local summary hy2_port port rc=0 quiet="${1:-0}"
     hy2_port=$(hy2_port_answer)
     if [[ ! -s "$XRAY_CONFIG" ]]; then
-        [[ "$quiet" -eq 1 ]] || mismatch "нет ${XRAY_CONFIG}"
+        [[ "$quiet" -eq 1 ]] || mismatch "$(L "нет ${XRAY_CONFIG}" "no ${XRAY_CONFIG}")"
         return 1
     fi
     summary=$(py config-summary "$XRAY_CONFIG") || return 1
     if [[ "$(json_get "$summary" reality.port)" != "$PUBLIC_TLS_PORT" || "$(json_get "$summary" reality.target)" != "$REALITY_TARGET" ]]; then
-        [[ "$quiet" -eq 1 ]] || mismatch "config.json: Reality не на ${PUBLIC_TLS_PORT} или target не ${REALITY_TARGET}"
+        [[ "$quiet" -eq 1 ]] || mismatch "$(L "config.json: Reality не на ${PUBLIC_TLS_PORT} или target не ${REALITY_TARGET}" "config.json: Reality is not on ${PUBLIC_TLS_PORT} or the target is not ${REALITY_TARGET}")"
         rc=1
     fi
     if [[ "$(json_get "$summary" reality.limit_fallback)" != "[]" ]]; then
-        [[ "$quiet" -eq 1 ]] || mismatch "config.json: в Reality ненулевые limitFallback"
+        [[ "$quiet" -eq 1 ]] || mismatch "$(L "config.json: в Reality ненулевые limitFallback" "config.json: Reality has non-zero limitFallback")"
         rc=1
     fi
     xray_holds_443 || {
-        [[ "$quiet" -eq 1 ]] || mismatch "Xray не слушает ${PUBLIC_TLS_PORT}/tcp"
+        [[ "$quiet" -eq 1 ]] || mismatch "$(L "Xray не слушает ${PUBLIC_TLS_PORT}/tcp" "Xray does not listen on ${PUBLIC_TLS_PORT}/tcp")"
         rc=1
     }
     if xhttp_enabled && ! tcp_listening "$NGINX_ADDR" "$(xhttp_port)"; then
-        [[ "$quiet" -eq 1 ]] || mismatch "XHTTP не слушает ${NGINX_ADDR}:$(xhttp_port)"
+        [[ "$quiet" -eq 1 ]] || mismatch "$(L "XHTTP не слушает ${NGINX_ADDR}:$(xhttp_port)" "XHTTP does not listen on ${NGINX_ADDR}:$(xhttp_port)")"
         rc=1
     fi
     if [[ "$hy2_port" != 0 ]]; then
-        if [[ "$(json_get "$summary" hy2.port)" != "$hy2_port" ]] || ! udp_listening "$hy2_port"; then
-            [[ "$quiet" -eq 1 ]] || mismatch "Hysteria2 не слушает UDP/${hy2_port}"
+        if [[ "$(json_get "$summary" hy2.port)" != "$hy2_port" ]] || ! xray_holds_udp "$hy2_port"; then
+            [[ "$quiet" -eq 1 ]] || mismatch "$(L "Hysteria2 не слушает UDP/${hy2_port}" "Hysteria2 does not listen on UDP/${hy2_port}")"
+            rc=1
+        fi
+        if [[ "$(json_get "$summary" hy2.plain)" != true || "$(json_get "$summary" hy2.reject_sni)" != true ]]; then
+            [[ "$quiet" -eq 1 ]] || mismatch "$(L "config.json: у Hysteria2 есть маски или выключен rejectUnknownSni" "config.json: Hysteria2 has masks or rejectUnknownSni is off")"
             rc=1
         fi
     fi
+    for port in $STALE_PORTS; do
+        [[ "$port" == */udp ]] && xray_holds_udp "${port%/udp}" && {
+            [[ "$quiet" -eq 1 ]] || mismatch "$(L "UDP/${port%/udp} всё ещё слушается после переноса Hysteria2" "UDP/${port%/udp} is still listening after moving Hysteria2")"
+            rc=1
+        }
+    done
     return "$rc"
 }
 
 check_inbounds() {
     local report rc=0 line
     if ! report=$(inbounds_report plan); then
-        mismatch "не удалось прочитать инбаунды: ${report}"
+        mismatch "$(L "не удалось прочитать инбаунды: ${report}" "failed to read inbounds: ${report}")"
         return 1
     fi
     while IFS= read -r line; do
@@ -3213,9 +3254,9 @@ check_inbounds() {
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         case "$line" in
-            reality) mismatch "нет инбаунда VLESS Reality" ;;
-            xhttp) mismatch "нет инбаунда VLESS XHTTP" ;;
-            hy2) mismatch "нет инбаунда Hysteria2" ;;
+            reality) mismatch "$(L "нет инбаунда VLESS Reality" "no VLESS Reality inbound")" ;;
+            xhttp) mismatch "$(L "нет инбаунда VLESS XHTTP" "no VLESS XHTTP inbound")" ;;
+            hy2) mismatch "$(L "нет инбаунда Hysteria2" "no Hysteria2 inbound")" ;;
         esac
         rc=1
     done < <(json_lines "$report" missing)
@@ -3229,7 +3270,7 @@ fix_inbounds() {
     xui_stop
     backup_db_once
     if ! report=$(inbounds_report main); then
-        log "Не удалось изменить инбаунды: ${report}"
+        log "$(L "Не удалось изменить инбаунды: ${report}" "Failed to change inbounds: ${report}")"
         xui_start
         return 1
     fi
@@ -3240,7 +3281,7 @@ fix_inbounds() {
     target=$(json_get "$report" reality.target)
     port=$(json_get "$report" reality.port)
     if [[ -n "$target" && "$target" != "$REALITY_TARGET" ]]; then
-        log "target Reality после записи: ${target}, ожидался ${REALITY_TARGET}; остановка, возможна петля"
+        log "$(L "target Reality после записи: ${target}, ожидался ${REALITY_TARGET}; остановка, возможна петля" "Reality target after writing: ${target}, expected ${REALITY_TARGET}; stopping, a loop is possible")"
         xui_start
         return 1
     fi
@@ -3250,7 +3291,7 @@ fix_inbounds() {
             return 1
         fi
         if ! report=$(inbounds_report port); then
-            log "Не удалось перевести Reality на ${PUBLIC_TLS_PORT}: ${report}"
+            log "$(L "Не удалось перевести Reality на ${PUBLIC_TLS_PORT}: ${report}" "Failed to move Reality to ${PUBLIC_TLS_PORT}: ${report}")"
             xui_start
             return 1
         fi
@@ -3274,36 +3315,50 @@ create_missing_inbounds() {
     if ! report=$(py create-missing "$(api_base)" "$token" "$XUI_DB" "$(xray_bin)" "$(conf_get DOMAIN)" \
         "$(conf_get CERT_FOLDER)" "$(xhttp_path_answer)" "$(hy2_port_answer)" "$REALITY_TARGET" \
         "$(conf_get CLIENT_NAME)" "$(xhttp_port)"); then
-        log "Не удалось создать инбаунды: ${report}"
+        log "$(L "Не удалось создать инбаунды: ${report}" "Failed to create inbounds: ${report}")"
         return 1
     fi
     log_quiet "$report"
     json_lines "$report" created | while IFS= read -r line; do
-        log "создан инбаунд $(json_get "$line" kind) $(json_get "$line" tag), порт $(json_get "$line" port)"
+        log "$(L "создан инбаунд $(json_get "$line" kind) $(json_get "$line" tag), порт $(json_get "$line" port)" "created inbound $(json_get "$line" kind) $(json_get "$line" tag), port $(json_get "$line" port)")"
     done
     if [[ -n "$(json_get "$report" new_client)" ]]; then
-        log "клиент $(json_get "$report" new_client.email) добавлен во все инбаунды"
+        log "$(L "клиент $(json_get "$report" new_client.email) добавлен во все инбаунды" "client $(json_get "$report" new_client.email) added to all inbounds")"
     fi
 }
 
 apply_inbounds() {
-    local report fatal
+    local report fatal others
     report=$(inbounds_report plan) || {
         log "$report"
         return 1
     }
     fatal=$(json_lines "$report" fatal)
     if [[ -n "$fatal" ]]; then
-        log "Требуется ручное решение:"
+        log "$(L "Требуется ручное решение:" "Manual action required:")"
         log_lines "  " <<< "$fatal"
         return 1
+    fi
+    others=$(udp_listeners "$HY2_PORT" | grep -v '"xray')
+    if [[ "$(hy2_port_answer)" != 0 && -n "$others" ]]; then
+        log "$(L "Порт ${HY2_PORT}/udp для Hysteria2 занят другим процессом:" "Port ${HY2_PORT}/udp for Hysteria2 is used by another process:")"
+        log_lines "  " <<< "$others"
+        return 1
+    fi
+    if [[ "$(hy2_port_answer)" != 0 ]] && ufw_present && ! ufw_allows "${HY2_PORT}/udp"; then
+        ufw allow "${HY2_PORT}/udp" comment "$SCRIPT_NAME" > /dev/null 2>&1 && log "$(L "ufw: добавлено ${HY2_PORT}/udp" "ufw: added ${HY2_PORT}/udp")"
     fi
     if [[ -n "$(json_lines "$report" problems)" ]]; then
         fix_inbounds || return 1
     fi
     create_missing_inbounds || return 1
     xui_restart || return 1
-    wait_for 20 runtime_inbounds_ok 1
+    wait_for 20 runtime_inbounds_ok 1 && return 0
+    runtime_inbounds_ok 0
+    for port in $STALE_PORTS; do
+        [[ "$port" == */udp ]] && log "$(L "правило ufw ${port} оставлено" "ufw rule ${port} is kept")"
+    done
+    return 1
 }
 
 # ХОСТЫ
@@ -3315,7 +3370,7 @@ hosts_report() {
 check_hosts() {
     local report rc=0 line
     report=$(hosts_report plan) || {
-        mismatch "не удалось прочитать Хосты: ${report}"
+        mismatch "$(L "не удалось прочитать Хосты: ${report}" "failed to read Hosts: ${report}")"
         return 1
     }
     while IFS= read -r line; do
@@ -3325,7 +3380,7 @@ check_hosts() {
     done < <(json_lines "$report" problems)
     report=$(inbounds_report plan)
     if [[ -n "$(json_lines "$report" problems)" ]]; then
-        mismatch "инбаунды изменились после записи Хостов"
+        mismatch "$(L "инбаунды изменились после записи Хостов" "inbounds changed after writing Hosts")"
         json_lines "$report" problems | mismatch_lines
         rc=1
     fi
@@ -3339,7 +3394,7 @@ apply_hosts() {
         xui_stop
         backup_db_once
         report=$(hosts_report fix) || {
-            log "Не удалось изменить Хосты: ${report}"
+            log "$(L "Не удалось изменить Хосты: ${report}" "Failed to change Hosts: ${report}")"
             xui_start
             return 1
         }
@@ -3351,13 +3406,13 @@ apply_hosts() {
     if [[ -n "$missing" && "$missing" != "[]" ]]; then
         token=$(api_token) || return 1
         report=$(py hosts-add "$(api_base)" "$token" "$missing") || {
-            log "Не удалось добавить Хосты: ${report}"
+            log "$(L "Не удалось добавить Хосты: ${report}" "Failed to add Hosts: ${report}")"
             return 1
         }
-        json_lines "$report" added | log_lines "добавлен Хост "
+        json_lines "$report" added | log_lines "$(L "добавлен Хост " "added Host ")"
     fi
     if [[ -n "$(json_lines "$(inbounds_report plan)" problems)" ]]; then
-        log "После записи Хостов изменился инбаунд, настройки инбаунда возвращены"
+        log "$(L "После записи Хостов изменился инбаунд, настройки инбаунда возвращены" "An inbound changed after writing Hosts, the inbound settings are restored")"
         fix_inbounds || return 1
     fi
     xui_restart
@@ -3368,20 +3423,20 @@ apply_hosts() {
 check_routing() {
     local summary rc=0
     if [[ ! -s "$XRAY_CONFIG" ]]; then
-        mismatch "нет ${XRAY_CONFIG}"
+        mismatch "$(L "нет ${XRAY_CONFIG}" "no ${XRAY_CONFIG}")"
         return 1
     fi
     summary=$(py config-summary "$XRAY_CONFIG") || return 1
     if [[ -z "$(json_get "$summary" reality.tag)" ]] || { xhttp_enabled && [[ -z "$(json_get "$summary" xhttp.tag)" ]]; }; then
-        mismatch "в config.json нет Reality$(xhttp_enabled && echo " или XHTTP")"
+        mismatch "$(L "в config.json нет Reality$(xhttp_enabled && echo " или XHTTP")" "config.json has no Reality$(xhttp_enabled && echo " or XHTTP")")"
         return 1
     fi
     if [[ "$(json_get "$summary" block_missing)" != "[]" ]]; then
-        mismatch "нет в правилах blocked: $(block_missing_text "$summary")"
+        mismatch "$(L "нет в правилах blocked: $(block_missing_text "$summary")" "missing from blocked rules: $(block_missing_text "$summary")")"
         rc=1
     fi
     [[ "$(json_get "$summary" udp443_ok)" == true ]] || {
-        mismatch "правило UDP/443 → blocked: $(json_get "$summary" udp443_actual), нужно $(json_get "$summary" udp443_expected)"
+        mismatch "$(L "правило UDP/443 → blocked: $(json_get "$summary" udp443_actual), нужно $(json_get "$summary" udp443_expected)" "UDP/443 → blocked rule: $(json_get "$summary" udp443_actual), expected $(json_get "$summary" udp443_expected)")"
         rc=1
     }
     return "$rc"
@@ -3398,17 +3453,17 @@ apply_routing() {
     xhttp=$(json_get "$summary" xhttp.tag)
     token=$(api_token) || return 1
     report=$(py routing-apply "$(api_base)" "$token" "$reality" "$xhttp" "$XRAY_CONFIG" "$(xray_bin)") || {
-        log "Не удалось изменить маршрутизацию: ${report}"
+        log "$(L "Не удалось изменить маршрутизацию: ${report}" "Failed to change routing: ${report}")"
         return 1
     }
     json_lines "$report" changes | while IFS= read -r line; do log_quiet "  ${line}"; done
     xui_restart || return 1
     token=$(api_token) || return 1
     report=$(py routing-test "$(api_base)" "$token" "$reality" "$xhttp") || {
-        log "Проверка routeTest не пройдена: $(json_get "$report" failed)"
+        log "$(L "Проверка routeTest не пройдена: $(json_get "$report" failed)" "routeTest check failed: $(json_get "$report" failed)")"
         return 1
     }
-    log "routeTest: правила срабатывают"
+    log "$(L "routeTest: правила срабатывают" "routeTest: the rules match")"
 }
 
 # UFW
@@ -3458,12 +3513,12 @@ ufw_stale_rules() {
 check_ufw() {
     local rc=0 rule
     if ! ufw_present; then
-        log "ufw не установлен, порты для внешнего файрвола: $(ufw_target_rules | tr '\n' ' ')"
+        log "$(L "ufw не установлен, порты для внешнего файрвола: $(ufw_target_rules | tr '\n' ' ')" "ufw is not installed, ports for an external firewall: $(ufw_target_rules | tr '\n' ' ')")"
         return 0
     fi
     while IFS= read -r rule; do
         ufw_allows "$rule" || {
-            mismatch "нет правила ufw ${rule}"
+            mismatch "$(L "нет правила ufw ${rule}" "no ufw rule ${rule}")"
             rc=1
         }
     done < <(ufw_target_rules)
@@ -3474,7 +3529,7 @@ apply_ufw() {
     local rule
     while IFS= read -r rule; do
         ufw_allows "$rule" && continue
-        ufw allow "$rule" comment "$SCRIPT_NAME" > /dev/null 2>&1 && log "ufw: добавлено ${rule}"
+        ufw allow "$rule" comment "$SCRIPT_NAME" > /dev/null 2>&1 && log "$(L "ufw: добавлено ${rule}" "ufw: added ${rule}")"
     done < <(ufw_target_rules)
 }
 
@@ -3483,7 +3538,7 @@ check_ufw_cleanup() {
     ufw_present || return 0
     while IFS= read -r rule; do
         [[ -n "$rule" ]] || continue
-        mismatch_minor "лишнее правило ufw ${rule}"
+        mismatch_minor "$(L "лишнее правило ufw ${rule}" "extra ufw rule ${rule}")"
         rc=1
     done < <(ufw_stale_rules)
     return "$rc"
@@ -3496,7 +3551,7 @@ apply_ufw_cleanup() {
         for i in 1 2 3; do
             ufw --force delete allow "$rule" > /dev/null 2>&1 || break
         done
-        log "ufw: удалено ${rule}"
+        log "$(L "ufw: удалено ${rule}" "ufw: removed ${rule}")"
     done < <(ufw_stale_rules)
 }
 
@@ -3506,9 +3561,9 @@ expect_tls() {
     local host="$1" port="$2" sni="$3" want="$4" what="$5" got
     got=$(tls_probe "$host" "$port" "$sni")
     if [[ "$got" == "$want" ]]; then
-        report_ok "${host}:${port}, ${what}: $([[ "$got" == cert ]] && echo 'свой сертификат' || echo 'отказ')"
+        report_ok "$(L "${host}:${port}, ${what}: $([[ "$got" == cert ]] && echo 'свой сертификат' || echo 'отказ')" "${host}:${port}, ${what}: $([[ "$got" == cert ]] && echo 'own certificate' || echo 'rejected')")"
     else
-        report_fail "${host}:${port}, ${what}: $([[ "$got" == cert ]] && echo 'выдан сертификат, ожидался отказ' || echo 'отказ, ожидался сертификат')"
+        report_fail "$(L "${host}:${port}, ${what}: $([[ "$got" == cert ]] && echo 'выдан сертификат, ожидался отказ' || echo 'отказ, ожидался сертификат')" "${host}:${port}, ${what}: $([[ "$got" == cert ]] && echo 'certificate served, rejection expected' || echo 'rejected, certificate expected')")"
     fi
 }
 
@@ -3516,21 +3571,21 @@ final_listen_checks() {
     local hy2_port addrs
     hy2_port=$(hy2_port_answer)
     if xray_holds_443 && ! tcp_listeners "$PUBLIC_TLS_PORT" | grep -qv '"xray'; then
-        report_ok "${PUBLIC_TLS_PORT}/tcp слушает только Xray"
+        report_ok "$(L "${PUBLIC_TLS_PORT}/tcp слушает только Xray" "Only Xray listens on ${PUBLIC_TLS_PORT}/tcp")"
     else
         report_fail "${PUBLIC_TLS_PORT}/tcp: $(tcp_listeners "$PUBLIC_TLS_PORT" | awk '{print $4, $6}' | tr '\n' ' ')"
     fi
     addrs=$(nginx_addresses | paste -sd ',' - | sed 's/,/, /g')
     if nginx_listens_expected; then
-        report_ok "nginx слушает $(nginx_expected_text)"
+        report_ok "$(L "nginx слушает $(nginx_expected_text)" "nginx listens on $(nginx_expected_text)")"
     else
-        report_fail "nginx слушает: ${addrs:-ничего}; нужно: $(nginx_expected_text)"
+        report_fail "$(L "nginx слушает: ${addrs:-ничего}; нужно: $(nginx_expected_text)" "nginx listens on: ${addrs:-nothing}; expected: $(nginx_expected_text)")"
     fi
     if [[ "$hy2_port" != 0 ]]; then
-        if udp_listening "$hy2_port"; then
-            report_ok "Hysteria2 слушает UDP/${hy2_port}"
+        if xray_holds_udp "$hy2_port"; then
+            report_ok "$(L "Hysteria2 слушает UDP/${hy2_port}" "Hysteria2 listens on UDP/${hy2_port}")"
         else
-            report_fail "Hysteria2 не слушает UDP/${hy2_port}"
+            report_fail "$(L "Hysteria2 не слушает UDP/${hy2_port}" "Hysteria2 does not listen on UDP/${hy2_port}")"
         fi
     fi
 }
@@ -3538,70 +3593,78 @@ final_listen_checks() {
 final_config_checks() {
     local summary loops
     summary=$(py config-summary "$XRAY_CONFIG") || {
-        report_fail "не удалось прочитать ${XRAY_CONFIG}"
+        report_fail "$(L "не удалось прочитать ${XRAY_CONFIG}" "failed to read ${XRAY_CONFIG}")"
         return
     }
     if [[ "$(json_get "$summary" reality.port)" == "$PUBLIC_TLS_PORT" && "$(json_get "$summary" reality.target)" == "$REALITY_TARGET" ]]; then
-        report_ok "config.json: Reality ${PUBLIC_TLS_PORT} → ${REALITY_TARGET}, тег $(json_get "$summary" reality.tag)"
+        report_ok "$(L "config.json: Reality ${PUBLIC_TLS_PORT} → ${REALITY_TARGET}, тег $(json_get "$summary" reality.tag)" "config.json: Reality ${PUBLIC_TLS_PORT} → ${REALITY_TARGET}, tag $(json_get "$summary" reality.tag)")"
     else
-        report_fail "config.json: Reality порт $(json_get "$summary" reality.port), target $(json_get "$summary" reality.target)"
+        report_fail "$(L "config.json: Reality порт $(json_get "$summary" reality.port), target $(json_get "$summary" reality.target)" "config.json: Reality port $(json_get "$summary" reality.port), target $(json_get "$summary" reality.target)")"
     fi
     if [[ "$(json_get "$summary" reality.limit_fallback)" == "[]" ]]; then
-        report_ok "config.json: ненулевых limitFallback нет"
+        report_ok "$(L "config.json: ненулевых limitFallback нет" "config.json: no non-zero limitFallback")"
     else
         report_fail "config.json: limitFallback $(json_get "$summary" reality.limit_fallback)"
     fi
+    if [[ "$(hy2_port_answer)" != 0 ]]; then
+        if [[ "$(json_get "$summary" hy2.port)" == "$HY2_PORT" && "$(json_get "$summary" hy2.plain)" == true \
+            && "$(json_get "$summary" hy2.reject_sni)" == true ]]; then
+            report_ok "$(L "config.json: Hysteria2 на ${HY2_PORT}/udp без маскировки, чужой SNI — отказ" "config.json: Hysteria2 on ${HY2_PORT}/udp without obfuscation, foreign SNI rejected")"
+        else
+            report_fail "$(L "config.json: Hysteria2 не по эталону (порт $(json_get "$summary" hy2.port), без маскировки: $(json_get "$summary" hy2.plain), rejectUnknownSni: $(json_get "$summary" hy2.reject_sni))" "config.json: Hysteria2 does not match the reference (port $(json_get "$summary" hy2.port), without obfuscation: $(json_get "$summary" hy2.plain), rejectUnknownSni: $(json_get "$summary" hy2.reject_sni))")"
+        fi
+    fi
     if [[ "$(json_get "$summary" sniffing_off)" == "[]" ]]; then
-        report_ok "config.json: sniffing http, tls, quic, routeOnly на всех инбаундах"
+        report_ok "$(L "config.json: sniffing http, tls, quic, routeOnly на всех инбаундах" "config.json: sniffing http, tls, quic, routeOnly on all inbounds")"
     else
-        report_fail "config.json: sniffing не по шаблону: $(json_lines "$summary" sniffing_off | paste -sd ',' - | sed 's/,/, /g')"
+        report_fail "$(L "config.json: sniffing не по шаблону: $(json_lines "$summary" sniffing_off | paste -sd ',' - | sed 's/,/, /g')" "config.json: sniffing does not match the template: $(json_lines "$summary" sniffing_off | paste -sd ',' - | sed 's/,/, /g')")"
     fi
     if [[ "$(json_get "$summary" block_missing)" == "[]" ]]; then
-        report_ok "правила blocked: geoip:private, IP RU, bittorrent, домены RU, реклама"
+        report_ok "$(L "правила blocked: geoip:private, IP RU, bittorrent, домены RU, реклама" "blocked rules: geoip:private, RU IPs, bittorrent, RU domains, ads")"
     else
-        report_fail "нет в правилах blocked: $(block_missing_text "$summary")"
+        report_fail "$(L "нет в правилах blocked: $(block_missing_text "$summary")" "missing from blocked rules: $(block_missing_text "$summary")")"
     fi
     if [[ "$(json_get "$summary" udp443_ok)" == true ]]; then
-        report_ok "правило UDP/443 → blocked: $(json_get "$summary" udp443_expected)"
+        report_ok "$(L "правило UDP/443 → blocked: $(json_get "$summary" udp443_expected)" "UDP/443 → blocked rule: $(json_get "$summary" udp443_expected)")"
     else
-        report_fail "правило UDP/443 → blocked: $(json_get "$summary" udp443_actual), нужно $(json_get "$summary" udp443_expected)"
+        report_fail "$(L "правило UDP/443 → blocked: $(json_get "$summary" udp443_actual), нужно $(json_get "$summary" udp443_expected)" "UDP/443 → blocked rule: $(json_get "$summary" udp443_actual), expected $(json_get "$summary" udp443_expected)")"
     fi
     loops=$(ss -Htn 2> /dev/null | grep -c "127.0.0.1:${PUBLIC_TLS_PORT} ")
     if [[ "$loops" -eq 0 ]]; then
-        report_ok "петли нет: соединений на 127.0.0.1:${PUBLIC_TLS_PORT} нет"
+        report_ok "$(L "петли нет: соединений на 127.0.0.1:${PUBLIC_TLS_PORT} нет" "no loop: no connections to 127.0.0.1:${PUBLIC_TLS_PORT}")"
     else
-        report_fail "петля: ${loops} соединений на 127.0.0.1:${PUBLIC_TLS_PORT}"
+        report_fail "$(L "петля: ${loops} соединений на 127.0.0.1:${PUBLIC_TLS_PORT}" "loop: ${loops} connections to 127.0.0.1:${PUBLIC_TLS_PORT}")"
     fi
 }
 
 final_tls_checks() {
     local domain="$1" ip="$2" code body
     if dest_ready "$domain"; then
-        report_ok "${REALITY_TARGET}: TLS 1.3 + h2, свой сертификат, без SNI — отказ"
+        report_ok "$(L "${REALITY_TARGET}: TLS 1.3 + h2, свой сертификат, без SNI — отказ" "${REALITY_TARGET}: TLS 1.3 + h2, own certificate, rejection without SNI")"
     else
-        report_fail "${REALITY_TARGET} не годится в target Reality"
+        report_fail "$(L "${REALITY_TARGET} не годится в target Reality" "${REALITY_TARGET} is not suitable as the Reality target")"
     fi
-    expect_tls "$ip" "$PUBLIC_TLS_PORT" "-" reject "без SNI"
-    expect_tls "$ip" "$PUBLIC_TLS_PORT" "scanner.invalid" reject "чужой SNI"
+    expect_tls "$ip" "$PUBLIC_TLS_PORT" "-" reject "$(L "без SNI" "without SNI")"
+    expect_tls "$ip" "$PUBLIC_TLS_PORT" "scanner.invalid" reject "$(L "чужой SNI" "foreign SNI")"
     expect_tls "$ip" "$PUBLIC_TLS_PORT" "$domain" cert "SNI ${domain}"
     code=$(http_code "https://${domain}/" "${domain}:${PUBLIC_TLS_PORT}:${ip}")
     if [[ "$code" == 200 ]]; then
-        report_ok "сайт через фолбек Reality: https://${domain}/ → 200"
+        report_ok "$(L "сайт через фолбек Reality: https://${domain}/ → 200" "site through the Reality fallback: https://${domain}/ → 200")"
     else
-        report_fail "сайт через фолбек Reality: https://${domain}/ → ${code}"
+        report_fail "$(L "сайт через фолбек Reality: https://${domain}/ → ${code}" "site through the Reality fallback: https://${domain}/ → ${code}")"
     fi
     code=$(http_code "https://${domain}$(conf_get PANEL_PATH)/" "${domain}:${PUBLIC_TLS_PORT}:${ip}")
     if [[ "$code" =~ ^(200|301|302|307|308)$ ]]; then
-        report_ok "панель через ${PUBLIC_TLS_PORT}: ${code}"
+        report_ok "$(L "панель через ${PUBLIC_TLS_PORT}: ${code}" "panel through ${PUBLIC_TLS_PORT}: ${code}")"
     else
-        report_fail "панель через ${PUBLIC_TLS_PORT}: ${code}"
+        report_fail "$(L "панель через ${PUBLIC_TLS_PORT}: ${code}" "panel through ${PUBLIC_TLS_PORT}: ${code}")"
     fi
     body=$(curl -sk --noproxy '*' --max-time 10 --resolve "${domain}:${PUBLIC_TLS_PORT}:${ip}" \
         "https://${domain}$(conf_get PANEL_PATH)/sponsors")
     if [[ "$body" == "$SPONSORS_EMPTY" ]]; then
-        report_ok "запрос рекламы 3x-ui перехватывает nginx: пустой список"
+        report_ok "$(L "запрос рекламы 3x-ui перехватывает nginx: пустой список" "the 3x-ui ad request is intercepted by nginx: empty list")"
     else
-        report_fail "запрос рекламы 3x-ui не перехвачен nginx, ответ: ${body:0:80}"
+        report_fail "$(L "запрос рекламы 3x-ui не перехвачен nginx, ответ: ${body:0:80}" "the 3x-ui ad request is not intercepted by nginx, response: ${body:0:80}")"
     fi
 }
 
@@ -3610,9 +3673,9 @@ expect_empty_reply() {
     shift
     code=$(curl_exit_code "$@")
     if [[ "$code" == 52 ]]; then
-        report_ok "${what}: соединение закрыто без ответа"
+        report_ok "$(L "${what}: соединение закрыто без ответа" "${what}: connection closed without a response")"
     else
-        report_fail "${what}: curl exit ${code}, ожидался 52 (закрытие без ответа)"
+        report_fail "$(L "${what}: curl exit ${code}, ожидался 52 (закрытие без ответа)" "${what}: curl exit ${code}, expected 52 (closed without a response)")"
     fi
 }
 
@@ -3626,27 +3689,27 @@ final_http_checks() {
     if [[ "$out" == "301 ${want}" ]]; then
         report_ok "http://${domain}/check80?x=1 → 301 ${want}"
     else
-        report_fail "http://${domain}/check80?x=1 → ${out% }, ожидался 301 ${want}"
+        report_fail "$(L "http://${domain}/check80?x=1 → ${out% }, ожидался 301 ${want}" "http://${domain}/check80?x=1 → ${out% }, expected 301 ${want}")"
     fi
     if challenge_served "$ip"; then
-        report_ok "http://${domain}/.well-known/acme-challenge/ отдаёт файлы из $(acme_challenge_dir)"
+        report_ok "$(L "http://${domain}/.well-known/acme-challenge/ отдаёт файлы из $(acme_challenge_dir)" "http://${domain}/.well-known/acme-challenge/ serves files from $(acme_challenge_dir)")"
     else
-        report_fail "http://${domain}/.well-known/acme-challenge/ не отдаёт файлы из $(acme_challenge_dir)"
+        report_fail "$(L "http://${domain}/.well-known/acme-challenge/ не отдаёт файлы из $(acme_challenge_dir)" "http://${domain}/.well-known/acme-challenge/ does not serve files from $(acme_challenge_dir)")"
     fi
     if acme_webroot_set; then
         report_ok "acme.sh: Le_Webroot='${ACME_WEBROOT}'"
     else
-        report_fail "acme.sh: нет Le_Webroot='${ACME_WEBROOT}' в $(acme_domain_conf)"
+        report_fail "$(L "acme.sh: нет Le_Webroot='${ACME_WEBROOT}' в $(acme_domain_conf)" "acme.sh: no Le_Webroot='${ACME_WEBROOT}' in $(acme_domain_conf)")"
     fi
     if [[ -s "$CERT_RENEW" ]] && ! grep -qE 'standalone|ufw' "$CERT_RENEW"; then
-        report_ok "${CERT_RENEW}: без standalone и ufw"
+        report_ok "$(L "${CERT_RENEW}: без standalone и ufw" "${CERT_RENEW}: without standalone and ufw")"
     else
-        report_fail "${CERT_RENEW} отсутствует или использует standalone / ufw"
+        report_fail "$(L "${CERT_RENEW} отсутствует или использует standalone / ufw" "${CERT_RENEW} is missing or uses standalone / ufw")"
     fi
     if renew_cron_present && ! acme_cron_present; then
-        report_ok "cron root: ${CERT_RENEW}, без acme.sh --cron"
+        report_ok "$(L "cron root: ${CERT_RENEW}, без acme.sh --cron" "root cron: ${CERT_RENEW}, without acme.sh --cron")"
     else
-        report_fail "cron root: нужна задача ${CERT_RENEW} и не нужна acme.sh --cron"
+        report_fail "$(L "cron root: нужна задача ${CERT_RENEW} и не нужна acme.sh --cron" "root cron: the ${CERT_RENEW} job is required and acme.sh --cron is not")"
     fi
 }
 
@@ -3654,7 +3717,7 @@ final_subscription_checks() {
     local domain="$1" ip="$2" sub_id url out body meta code type endpoints hy2_port line
     sub_id=$(json_get "$(xui_discover)" sub_id)
     if [[ -z "$sub_id" ]]; then
-        report_fail "не найден клиент с subId"
+        report_fail "$(L "не найден клиент с subId" "no client with a subId found")"
         return
     fi
     out=$(curl -sk --noproxy '*' --max-time 10 --resolve "${domain}:${PUBLIC_TLS_PORT}:${ip}" \
@@ -3664,11 +3727,11 @@ final_subscription_checks() {
     code="${meta%%|*}"
     type="${meta#*|}"
     if [[ "$code" != 200 || -z "$body" || "$type" == *text/html* ]]; then
-        report_fail "подписка через ${PUBLIC_TLS_PORT}: код ${code}, тип ${type}"
+        report_fail "$(L "подписка через ${PUBLIC_TLS_PORT}: код ${code}, тип ${type}" "subscription through ${PUBLIC_TLS_PORT}: code ${code}, type ${type}")"
         return
     fi
     endpoints=$(py sub-endpoints <<< "$body")
-    report_ok "подписка через ${PUBLIC_TLS_PORT}: 200, ссылки:"
+    report_ok "$(L "подписка через ${PUBLIC_TLS_PORT}: 200, ссылки:" "subscription through ${PUBLIC_TLS_PORT}: 200, links:")"
     py json-lines "{\"items\": ${endpoints}}" items | while IFS= read -r line; do
         log "  $(json_get "$line" scheme)://…@$(json_get "$line" host):$(json_get "$line" port) $(json_get "$line" type) $(json_get "$line" security)"
     done
@@ -3679,9 +3742,9 @@ final_subscription_checks() {
     url="https://${domain}$(conf_get SUB_PATH)/verify-fake-subid-00000000"
     code=$(http_code "$url" "${domain}:${PUBLIC_TLS_PORT}:${ip}")
     if [[ "$code" == 404 ]]; then
-        report_ok "несуществующий subId → 404"
+        report_ok "$(L "несуществующий subId → 404" "non-existent subId → 404")"
     else
-        report_fail "несуществующий subId → ${code}, ожидался 404"
+        report_fail "$(L "несуществующий subId → ${code}, ожидался 404" "non-existent subId → ${code}, expected 404")"
     fi
 }
 
@@ -3696,9 +3759,9 @@ ok = any(i["scheme"] in schemes and i["host"] == host and i["port"] == port
          and (not marker or marker in (i["type"], i["security"])) for i in items)
 sys.exit(0 if ok else 1)
 ' "$endpoints" "$scheme" "$host" "$port" "$marker"; then
-        report_ok "в подписке ${name}: ${host}:${port}"
+        report_ok "$(L "в подписке ${name}: ${host}:${port}" "in the subscription ${name}: ${host}:${port}")"
     else
-        report_fail "в подписке нет ${name} с адресом ${host}:${port}"
+        report_fail "$(L "в подписке нет ${name} с адресом ${host}:${port}" "the subscription has no ${name} with address ${host}:${port}")"
     fi
 }
 
@@ -3706,17 +3769,17 @@ final_journal_checks() {
     local since
     since=$(systemctl show -p ActiveEnterTimestamp --value x-ui 2> /dev/null)
     if [[ -z "$since" ]]; then
-        report_warn "не удалось определить время запуска x-ui, журнал не проверен"
+        report_warn "$(L "не удалось определить время запуска x-ui, журнал не проверен" "failed to determine the x-ui start time, the journal is not checked")"
         return
     fi
     since=$(date -d "$since" '+%F %T' 2> /dev/null) || since=""
     if journalctl -u x-ui --since "${since:-today}" --no-pager 2> /dev/null | grep -qi 'non-443'; then
-        report_fail "в журнале x-ui есть предупреждение REALITY о порте не 443"
+        report_fail "$(L "в журнале x-ui есть предупреждение REALITY о порте не 443" "the x-ui journal has a REALITY warning about a port other than 443")"
     else
-        report_ok "предупреждения REALITY о порте не 443 в журнале нет"
+        report_ok "$(L "предупреждения REALITY о порте не 443 в журнале нет" "no REALITY warning about a port other than 443 in the journal")"
     fi
     if journalctl -u x-ui --since "${since:-today}" --no-pager 2> /dev/null | grep -v 'systemd\[' | grep -qiE 'failed to (build|start)'; then
-        report_fail "в журнале x-ui есть ошибки запуска Xray"
+        report_fail "$(L "в журнале x-ui есть ошибки запуска Xray" "the x-ui journal has Xray start errors")"
     fi
 }
 
@@ -3725,29 +3788,29 @@ final_service_checks() {
     local unit
     for unit in nginx x-ui; do
         if systemctl is-active --quiet "$unit"; then
-            report_ok "${unit} активен"
+            report_ok "$(L "${unit} активен" "${unit} is active")"
         else
-            report_fail "${unit} не активен"
+            report_fail "$(L "${unit} не активен" "${unit} is not active")"
         fi
     done
     if ! ufw_present; then
-        report_warn "ufw не установлен, порты для внешнего файрвола: $(ufw_target_rules | tr '\n' ' ')"
+        report_warn "$(L "ufw не установлен, порты для внешнего файрвола: $(ufw_target_rules | tr '\n' ' ')" "ufw is not installed, ports for an external firewall: $(ufw_target_rules | tr '\n' ' ')")"
         return
     fi
     while IFS= read -r rule; do
         if ufw_allows "$rule"; then
             report_ok "ufw: ${rule}"
         else
-            report_fail "ufw: нет ${rule}"
+            report_fail "$(L "ufw: нет ${rule}" "ufw: no ${rule}")"
         fi
     done < <(ufw_target_rules)
     extra=$(ufw_simple_rules | cut -d'|' -f1 | grep -vxF -f <(ufw_target_rules) | grep -vxF -f <(ufw_target_rules | cut -d/ -f1) \
         | grep -vxF -f <(ufw_stale_rules; echo "-") | tr '\n' ' ')
     if [[ -n "${extra// /}" ]]; then
-        report_warn "в ufw есть другие правила: ${extra% }"
+        report_warn "$(L "в ufw есть другие правила: ${extra% }" "ufw has other rules: ${extra% }")"
     fi
     if ! ufw status 2> /dev/null | grep -q 'Status: active'; then
-        report_warn "ufw выключен, правила не действуют"
+        report_warn "$(L "ufw выключен, правила не действуют" "ufw is disabled, the rules have no effect")"
     fi
 }
 
@@ -3762,7 +3825,7 @@ final_checks() {
         final_http_checks "$domain" "$ip"
         final_subscription_checks "$domain" "$ip"
     else
-        report_fail "не удалось определить публичный IPv4"
+        report_fail "$(L "не удалось определить публичный IPv4" "failed to determine the public IPv4")"
     fi
     final_journal_checks
     final_service_checks
@@ -3843,7 +3906,7 @@ installed_packages() {
 remove_paths() {
     local f
     while IFS= read -r f; do
-        rm -rf -- "$f" && log "удалён ${f}"
+        rm -rf -- "$f" && log "$(L "удалён ${f}" "removed ${f}")"
     done
 }
 
@@ -3853,8 +3916,8 @@ uninstall_xui() {
     systemctl disable --now x-ui > /dev/null 2>&1
     if [[ -s "$XUI_DB" ]]; then
         backup="/root/x-ui.db.$(date +%F-%H%M%S)"
-        cp -p "$XUI_DB" "$backup" || die "не удалось скопировать ${XUI_DB}"
-        log "копия базы: ${backup}"
+        cp -p "$XUI_DB" "$backup" || die "$(L "не удалось скопировать ${XUI_DB}" "failed to copy ${XUI_DB}")"
+        log "$(L "копия базы: ${backup}" "database copy: ${backup}")"
     fi
     [[ "$files" == *"/etc/fail2ban/"* ]] && f2b=1
     remove_paths <<< "$files"
@@ -3864,7 +3927,7 @@ uninstall_xui() {
         systemctl restart fail2ban > /dev/null 2>&1
     fi
     conf_unset XHTTP XHTTP_PORT XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH \
-        XUI_CREDENTIALS_PENDING HY2 HY2_PORT CLIENT_NAME
+        XUI_CREDENTIALS_PENDING HY2 CLIENT_NAME
 }
 
 uninstall_nginx() {
@@ -3873,7 +3936,7 @@ uninstall_nginx() {
         if nginx -t > /dev/null 2>&1; then
             systemctl reload nginx > /dev/null 2>&1
         else
-            report_warn "nginx -t: ошибка конфигурации после удаления"
+            report_warn "$(L "nginx -t: ошибка конфигурации после удаления" "nginx -t: configuration error after removal")"
         fi
     fi
 }
@@ -3882,7 +3945,7 @@ uninstall_cert() {
     local domain others
     domain=$(conf_get DOMAIN)
     if renew_cron_present; then
-        { crontab -l -u root 2> /dev/null | grep -vF "$CERT_RENEW" || true; } | crontab -u root - && log "удалена задача cron ${CERT_RENEW}"
+        { crontab -l -u root 2> /dev/null | grep -vF "$CERT_RENEW" || true; } | crontab -u root - && log "$(L "удалена задача cron ${CERT_RENEW}" "removed the cron job ${CERT_RENEW}")"
     fi
     if [[ -x "$ACME" && -n "$domain" ]]; then
         "$ACME" --remove -d "$domain" --ecc >> "$LOG_FILE" 2>&1
@@ -3892,9 +3955,9 @@ uninstall_cert() {
         others=$(acme_other_domains | tr '\n' ' ')
         if [[ -z "$others" ]]; then
             "$ACME" --uninstall >> "$LOG_FILE" 2>&1
-            rm -rf /root/.acme.sh && log "удалён /root/.acme.sh"
+            rm -rf /root/.acme.sh && log "$(L "удалён /root/.acme.sh" "removed /root/.acme.sh")"
         else
-            log "acme.sh оставлен, другие домены: ${others% }"
+            log "$(L "acme.sh оставлен, другие домены: ${others% }" "acme.sh kept, other domains: ${others% }")"
         fi
     fi
 }
@@ -3902,23 +3965,23 @@ uninstall_cert() {
 uninstall_ufw() {
     local rule
     if ! ufw_present; then
-        log "ufw не установлен"
+        log "$(L "ufw не установлен" "ufw is not installed")"
         return 0
     fi
     while IFS= read -r rule; do
-        ufw --force delete allow "$rule" > /dev/null 2>&1 && log "ufw: удалено ${rule}"
+        ufw --force delete allow "$rule" > /dev/null 2>&1 && log "$(L "ufw: удалено ${rule}" "ufw: removed ${rule}")"
     done < <(script_ufw_rules)
 }
 
 uninstall_packages() {
     local packages=("$@")
     if ! DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq "${packages[@]}" >> "$LOG_FILE" 2>&1; then
-        die "apt-get purge завершился с ошибкой"
+        die "$(L "apt-get purge завершился с ошибкой" "apt-get purge failed")"
     fi
-    log "удалены пакеты: ${packages[*]}"
+    log "$(L "удалены пакеты: ${packages[*]}" "removed packages: ${packages[*]}")"
     if [[ " ${packages[*]} " == *" nginx "* && "$(ls -A /var/www/html 2> /dev/null)" == index.nginx-debian.html ]]; then
-        rm -rf /var/www/html && log "удалён /var/www/html"
-        rmdir /var/www 2> /dev/null && log "удалён /var/www"
+        rm -rf /var/www/html && log "$(L "удалён /var/www/html" "removed /var/www/html")"
+        rmdir /var/www 2> /dev/null && log "$(L "удалён /var/www" "removed /var/www")"
     fi
 }
 
@@ -3926,13 +3989,13 @@ uninstall_rest() {
     local kept log_file="$LOG_FILE"
     remove_paths < <(rest_files | grep -vxF "$log_file" | existing)
     if [[ -z "$(installed_packages nginx)" ]]; then
-        rmdir /var/www 2> /dev/null && log "удалён /var/www"
+        rmdir /var/www 2> /dev/null && log "$(L "удалён /var/www" "removed /var/www")"
     fi
     kept=$(compgen -G '/etc/nginx/snippets/xui-panel*.conf' | tr '\n' ' ')
-    [[ -n "$kept" ]] && log "оставлены файлы пользователя: ${kept% }"
+    [[ -n "$kept" ]] && log "$(L "оставлены файлы пользователя: ${kept% }" "user files kept: ${kept% }")"
     LOG_FILE=/dev/null
     rm -f "$log_file"
-    log "удалён ${log_file}"
+    log "$(L "удалён ${log_file}" "removed ${log_file}")"
 }
 
 uninstall_plan() {
@@ -3940,11 +4003,11 @@ uninstall_plan() {
     case "$item" in
         xui)
             xui_files | existing
-            [[ -s "$XUI_DB" ]] && echo "(копия базы сохраняется в /root/x-ui.db.<дата>)"
+            [[ -s "$XUI_DB" ]] && printf '%s\n' "$(L "(копия базы сохраняется в /root/x-ui.db.<дата>)" "(the database is copied to /root/x-ui.db.<date>)")"
             ;;
         nginx) nginx_files ;;
         cert)
-            renew_cron_present && echo "задача cron ${CERT_RENEW}"
+            renew_cron_present && printf '%s\n' "$(L "задача cron ${CERT_RENEW}" "cron job ${CERT_RENEW}")"
             cert_files | existing
             [[ -x "$ACME" && -z "$(acme_other_domains)" ]] && echo "/root/.acme.sh"
             ;;
@@ -3958,7 +4021,7 @@ read_components() {
     local choice n
     while true; do
         prompted
-        read -r -p "Номера через пробел: " choice || die "Ввод прерван."
+        read -r -p "$(L "Номера через пробел: " "Numbers separated by spaces: ")" choice || die "$(L "Ввод прерван." "Input interrupted.")"
         _rc_out=()
         for n in $choice; do
             if [[ ! "$n" =~ ^[1-5]$ ]]; then
@@ -3968,40 +4031,40 @@ read_components() {
             _rc_out+=("$n")
         done
         ((${#_rc_out[@]} > 0)) && return 0
-        echo "  Ожидаются номера 1–5."
+        printf '%s\n' "$(L "  Ожидаются номера 1–5." "  Expected numbers 1–5.")"
     done
 }
 
 run_uninstall() {
     local -a numbers=() items=() packages=() candidates=()
-    local -A titles=([xui]="3x-ui" [nginx]="nginx" [cert]="Сертификат" [ufw]="ufw" [rest]="Прочие файлы")
+    local -A titles=([xui]="3x-ui" [nginx]="nginx" [cert]="$(L "Сертификат" "Certificate")" [ufw]="ufw" [rest]="$(L "Прочие файлы" "Other files")")
     local -A picked=()
     local item n line plan folder
     if [[ ! -t 0 ]]; then
-        echo "--uninstall: нужен ввод с терминала" >&2
+        printf '%s\n' "$(L "--uninstall: нужен ввод с терминала" "--uninstall: terminal input is required")" >&2
         exit 1
     fi
     init_log
-    trap 'die "Прервано."' INT TERM HUP
+    trap 'die "$(L "Прервано." "Interrupted.")"' INT TERM HUP
     conf_load
     [[ -n "$(conf_get DOMAIN)" ]] || CONF[DOMAIN]=$(discover_domain)
     if [[ -z "$(conf_get CERT_FOLDER)" ]]; then
         folder=$(discover_cert_folder)
         CONF[CERT_FOLDER]="${folder:-$(conf_get DOMAIN)}"
     fi
-    emit "${SCRIPT_NAME} --uninstall, журнал: ${LOG_FILE}"
+    emit "$(L "${SCRIPT_NAME} --uninstall, журнал: ${LOG_FILE}" "${SCRIPT_NAME} --uninstall, log: ${LOG_FILE}")"
     if [[ -n "$(conf_get DOMAIN)" ]]; then
-        emit "Домен: $(conf_get DOMAIN)"
+        emit "$(L "Домен: $(conf_get DOMAIN)" "Domain: $(conf_get DOMAIN)")"
     else
-        emit "Домен не определён: файлы сайта nginx, сертификата и заглушки не найдены"
+        emit "$(L "Домен не определён: файлы сайта nginx, сертификата и заглушки не найдены" "Domain not determined: nginx site, certificate and decoy files not found")"
     fi
     emit ""
-    emit "Компоненты:"
-    emit "  1  3x-ui: панель, Xray, база, служба x-ui, jail fail2ban 3x-ipl"
-    emit "  2  nginx: конфиги сайта, антискан, порт 80"
-    emit "  3  сертификат: $(cert_dir), acme.sh, cert-renew.sh, задача cron"
-    emit "  4  правила ufw с комментарием ${SCRIPT_NAME}, кроме SSH"
-    emit "  5  всё перечисленное, сайт-заглушка, файл ответов, журнал, архивы /root/nginx-*.tgz"
+    emit "$(L "Компоненты:" "Components:")"
+    emit "$(L "  1  3x-ui: панель, Xray, база, служба x-ui, jail fail2ban 3x-ipl" "  1  3x-ui: panel, Xray, database, x-ui service, fail2ban jail 3x-ipl")"
+    emit "$(L "  2  nginx: конфиги сайта, антискан, порт 80" "  2  nginx: site configs, anti-scan, port 80")"
+    emit "$(L "  3  сертификат: $(cert_dir), acme.sh, cert-renew.sh, задача cron" "  3  certificate: $(cert_dir), acme.sh, cert-renew.sh, cron job")"
+    emit "$(L "  4  правила ufw с комментарием ${SCRIPT_NAME}, кроме SSH" "  4  ufw rules with the ${SCRIPT_NAME} comment, except SSH")"
+    emit "$(L "  5  всё перечисленное, сайт-заглушка, файл ответов, журнал, архивы /root/nginx-*.tgz" "  5  everything above, decoy site, answers file, log, /root/nginx-*.tgz archives")"
     read_components numbers
     for n in "${numbers[@]}"; do
         case "$n" in
@@ -4017,30 +4080,30 @@ run_uninstall() {
     done
     [[ -n "${picked[nginx]:-}" ]] && mapfile -t -O "${#candidates[@]}" candidates < <(installed_packages 'nginx*' 'libnginx-mod-*')
     [[ -n "${picked[xui]:-}" ]] && mapfile -t -O "${#candidates[@]}" candidates < <(installed_packages fail2ban)
-    if ((${#candidates[@]} > 0)) && ask_yes_no "Удалить пакеты: ${candidates[*]}?" n; then
+    if ((${#candidates[@]} > 0)) && ask_yes_no "$(L "Удалить пакеты: ${candidates[*]}?" "Remove packages: ${candidates[*]}?")" n; then
         packages=("${candidates[@]}")
     fi
 
     emit ""
-    emit "Будет удалено:"
+    emit "$(L "Будет удалено:" "To be removed:")"
     for item in "${items[@]}"; do
         emit "  ${titles[$item]}:"
         plan=$(uninstall_plan "$item")
         if [[ -n "$plan" ]]; then
             while IFS= read -r line; do emit "    ${line}"; done <<< "$plan"
         else
-            emit "    нечего удалять"
+            emit "$(L "    нечего удалять" "    nothing to remove")"
         fi
     done
-    ((${#packages[@]} > 0)) && emit "  Пакеты: ${packages[*]}"
+    ((${#packages[@]} > 0)) && emit "$(L "  Пакеты: ${packages[*]}" "  Packages: ${packages[*]}")"
     if [[ -n "${picked[nginx]:-}" && -z "${picked[xui]:-}" && -x "$XUI_BIN" ]]; then
-        emit "! 3x-ui остаётся: Reality без nginx на ${REALITY_TARGET} не работает"
+        emit "$(L "! 3x-ui остаётся: Reality без nginx на ${REALITY_TARGET} не работает" "! 3x-ui stays: Reality does not work without nginx on ${REALITY_TARGET}")"
     fi
     if [[ -n "${picked[cert]:-}" && (-z "${picked[nginx]:-}" || -z "${picked[xui]:-}") ]]; then
-        emit "! nginx и Hysteria2 используют сертификат из $(cert_dir)"
+        emit "$(L "! nginx и Hysteria2 используют сертификат из $(cert_dir)" "! nginx and Hysteria2 use the certificate from $(cert_dir)")"
     fi
-    ask_yes_no "Удалить?" n || {
-        emit "Отменено."
+    ask_yes_no "$(L "Удалить?" "Remove?")" n || {
+        emit "$(L "Отменено." "Cancelled.")"
         exit 0
     }
 
@@ -4048,24 +4111,24 @@ run_uninstall() {
     emit ""
     for item in "${items[@]}"; do
         if [[ "$item" == rest ]] && ((${#packages[@]} > 0)); then
-            step "Пакеты"
+            step "$(L "Пакеты" "Packages")"
             uninstall_packages "${packages[@]}"
-            report_ok "готово"
+            report_ok "$(L "готово" "done")"
             step_end
             packages=()
         fi
         step "${titles[$item]}"
         "uninstall_${item}"
-        report_ok "готово"
+        report_ok "$(L "готово" "done")"
         step_end
     done
     if ((${#packages[@]} > 0)); then
-        step "Пакеты"
+        step "$(L "Пакеты" "Packages")"
         uninstall_packages "${packages[@]}"
-        report_ok "готово"
+        report_ok "$(L "готово" "done")"
         step_end
     fi
-    emit "Удаление завершено."
+    emit "$(L "Удаление завершено." "Removal complete.")"
     exit 0
 }
 
@@ -4075,20 +4138,25 @@ panel_password_text() {
     if [[ -n "$(conf_get XUI_PASSWORD)" && "$(py panel-user "$XUI_DB" password)" == "$(conf_get XUI_PASSWORD_HASH)" ]]; then
         conf_get XUI_PASSWORD
     else
-        printf 'задан вне скрипта, смена: sudo bash %s --reconfigure' "${0##*/}"
+        L "задан вне скрипта, смена: sudo bash ${0##*/} --reconfigure" "set outside the script, to change: sudo bash ${0##*/} --reconfigure"
     fi
 }
 
 print_summary() {
-    log "Установка завершена."
-    log "Панель:    https://$(conf_get DOMAIN)$(conf_get PANEL_PATH)/"
-    log "Логин:     $(py panel-user "$XUI_DB" username)"
-    log "Пароль:    $(panel_password_text)"
-    log "Подписка:  https://$(conf_get DOMAIN)$(conf_get SUB_PATH)/$(json_get "$(xui_discover)" sub_id)"
-    [[ "$TWO_FA_RESET" -eq 1 ]] && log "2FA:       отключена при импорте"
+    local domain user password sub
+    domain=$(conf_get DOMAIN)
+    user=$(py panel-user "$XUI_DB" username)
+    password=$(panel_password_text)
+    sub="https://${domain}$(conf_get SUB_PATH)/$(json_get "$(xui_discover)" sub_id)"
+    log "$(L "Установка завершена." "Installation complete.")"
+    log "$(L "Панель:    " "Panel:        ")https://${domain}$(conf_get PANEL_PATH)/"
+    log "$(L "Логин:     " "Username:     ")${user}"
+    log "$(L "Пароль:    " "Password:     ")${password}"
+    log "$(L "Подписка:  " "Subscription: ")${sub}"
+    [[ "$TWO_FA_RESET" -eq 1 ]] && log "$(L "2FA:       отключена при импорте" "2FA:          disabled on import")"
     if grep -qF '<title>403 Forbidden</title>' "$(www_dir)/index.html" 2> /dev/null; then
         log ""
-        log "Сейчас на сайте страница 403. Свою заглушку — index.html и фавиконку — можно положить в $(www_dir)/"
+        log "$(L "Сейчас на сайте страница 403. Свою заглушку — index.html и фавиконку — можно положить в $(www_dir)/" "The site now shows a 403 page. A custom decoy — index.html and a favicon — can be placed in $(www_dir)/")"
     fi
     return 0
 }
@@ -4099,7 +4167,7 @@ check_tools() {
         command -v "$cmd" > /dev/null 2>&1 || missing+=("$cmd")
     done
     ((${#missing[@]} == 0)) && return 0
-    report_fail "не найдены команды: ${missing[*]}"
+    report_fail "$(L "не найдены команды: ${missing[*]}" "commands not found: ${missing[*]}")"
     return 1
 }
 
@@ -4112,11 +4180,11 @@ check_resolve_answers() {
         CONF[CERT_FOLDER]="${value:-$(conf_get DOMAIN)}"
     fi
     discovered=$(xui_discover)
-    for key in "XHTTP_PATH:xhttp_path:путь XHTTP" "SUB_PATH:sub_path:путь подписки" "PANEL_PATH:web_base_path:путь панели"; do
+    for key in "$(L "XHTTP_PATH:xhttp_path:путь XHTTP" "XHTTP_PATH:xhttp_path:XHTTP path")" "$(L "SUB_PATH:sub_path:путь подписки" "SUB_PATH:sub_path:subscription path")" "$(L "PANEL_PATH:web_base_path:путь панели" "PANEL_PATH:web_base_path:panel path")"; do
         IFS=: read -r name field label <<< "$key"
         value=$(normalize_path "$(json_get "$discovered" "$field")")
         if [[ -n "$value" && -n "$(conf_get "$name")" && "$value" != "$(normalize_path "$(conf_get "$name")")" ]]; then
-            report_warn "файл ответов ${CONF_FILE}: ${label} $(normalize_path "$(conf_get "$name")"), в базе 3x-ui ${value}; проверка по базе, запуск без --check применит значение из файла ответов"
+            report_warn "$(L "файл ответов ${CONF_FILE}: ${label} $(normalize_path "$(conf_get "$name")"), в базе 3x-ui ${value}; проверка по базе, запуск без --check применит значение из файла ответов" "answers file ${CONF_FILE}: ${label} $(normalize_path "$(conf_get "$name")"), in the 3x-ui database ${value}; checking against the database, a run without --check applies the value from the answers file")"
         fi
         [[ -n "$value" || -z "$(conf_get "$name")" ]] && CONF[$name]="$value"
     done
@@ -4129,19 +4197,18 @@ check_resolve_answers() {
         hy2_port=$(json_get "$discovered" hy2_port)
         if [[ -n "$hy2_port" ]]; then
             CONF[HY2]=yes
-            CONF[HY2_PORT]="$hy2_port"
         else
             CONF[HY2]=no
         fi
     fi
-    log "Домен: $(conf_get DOMAIN), сертификат: $(cert_dir), XHTTP: $(xhttp_enabled && echo да || echo нет), Hysteria2: $([[ "$(hy2_port_answer)" != 0 ]] && echo "UDP/$(hy2_port_answer)" || echo нет)"
+    log "$(L "Домен: $(conf_get DOMAIN), сертификат: $(cert_dir), XHTTP: $(xhttp_enabled && echo да || echo нет), Hysteria2: $([[ "$(hy2_port_answer)" != 0 ]] && echo "UDP/$(hy2_port_answer)" || echo нет)" "Domain: $(conf_get DOMAIN), certificate: $(cert_dir), XHTTP: $(xhttp_enabled && echo yes || echo no), Hysteria2: $([[ "$(hy2_port_answer)" != 0 ]] && echo "UDP/$(hy2_port_answer)" || echo no)")"
 }
 
 check_step() {
     local title="$1" name="$2"
     step "$title"
     if "check_${name}"; then
-        report_ok "соответствует"
+        report_ok "$(L "соответствует" "matches")"
     fi
     step_end
 }
@@ -4149,83 +4216,86 @@ check_step() {
 run_check() {
     LOG_FILE=/dev/null
     trap 'exit 2' INT TERM HUP
-    emit "${SCRIPT_NAME} --check: проверка без изменений на сервере"
+    emit "$(L "${SCRIPT_NAME} --check: проверка без изменений на сервере" "${SCRIPT_NAME} --check: check without changes on the server")"
     check_tools || exit 2
     load_py_helper
     conf_load
     if ! check_resolve_answers; then
-        report_fail "домен не определён: нет файла ответов ${CONF_FILE} и server_name в конфигах nginx"
+        report_fail "$(L "домен не определён: нет файла ответов ${CONF_FILE} и server_name в конфигах nginx" "domain not determined: no answers file ${CONF_FILE} and no server_name in nginx configs")"
         exit 2
     fi
     STEP_TOTAL=$((5 + $(xui_has_config && echo 6 || echo 0) + $(ufw_present && echo 1 || echo 0)))
     emit ""
-    check_step "nginx: порт 80" http
-    check_step "Сертификат" cert
+    check_step "$(L "nginx: порт 80" "nginx: port 80")" http
+    check_step "$(L "Сертификат" "Certificate")" cert
     check_step "3x-ui" xui
     if xui_has_config; then
         check_step "nginx" nginx
-        check_step "Панель 3x-ui" panel
-        check_step "Подписка" subscription
-        check_step "Инбаунды" inbounds
-        check_step "Хосты" hosts
-        check_step "Маршрутизация" routing
+        check_step "$(L "Панель 3x-ui" "3x-ui panel")" panel
+        check_step "$(L "Подписка" "Subscription")" subscription
+        check_step "$(L "Инбаунды" "Inbounds")" inbounds
+        check_step "$(L "Хосты" "Hosts")" hosts
+        check_step "$(L "Маршрутизация" "Routing")" routing
     else
-        report_fail "в ${XUI_DB} нет инбаундов 3x-ui: проверки nginx, панели, подписки, инбаундов, Хостов и маршрутизации пропущены"
+        report_fail "$(L "в ${XUI_DB} нет инбаундов 3x-ui: проверки nginx, панели, подписки, инбаундов, Хостов и маршрутизации пропущены" "${XUI_DB} has no 3x-ui inbounds: nginx, panel, subscription, inbound, Host and routing checks are skipped")"
         emit ""
     fi
     check_step "ufw" ufw
-    ufw_present && check_step "ufw: лишние правила" ufw_cleanup
-    step "Проверка"
+    ufw_present && check_step "$(L "ufw: лишние правила" "ufw: extra rules")" ufw_cleanup
+    step "$(L "Проверка" "Check")"
     final_checks
     step_end
     if [[ "$FAIL_COUNT" -eq 0 ]]; then
-        log "Проверка завершена: ошибок нет."
+        log "$(L "Проверка завершена: ошибок нет." "Check complete: no errors.")"
         exit 0
     fi
-    log "Проверка завершена: ошибок: ${FAIL_COUNT}."
+    log "$(L "Проверка завершена: ошибок: ${FAIL_COUNT}." "Check complete, errors: ${FAIL_COUNT}.")"
     exit 1
 }
 
 main() {
+    [[ -r "$CONF_FILE" ]] && conf_load
     parse_args "$@"
     if [[ "$(id -u)" -ne 0 ]]; then
-        echo "Нужен root: sudo bash ${0##*/}" >&2
+        printf '%s\n' "Нужен root / Root is required: sudo bash ${0##*/}" >&2
         exit $((CHECK_ONLY == 1 ? 2 : 1))
     fi
     [[ "$CHECK_ONLY" -eq 1 ]] && run_check
     [[ "$UNINSTALL" -eq 1 ]] && run_uninstall
     init_log
-    trap 'die "Прервано. Повторный запуск продолжит с текущего состояния."' INT TERM HUP
+    conf_load
+    [[ -f "$CONF_FILE" ]] && conf_save
+    resolve_language
+    trap 'die "$(L "Прервано. Повторный запуск продолжит с текущего состояния." "Interrupted. A re-run continues from the current state.")"' INT TERM HUP
     STEP_TOTAL=12
-    emit "${SCRIPT_NAME}, журнал: ${LOG_FILE}"
+    emit "$(L "${SCRIPT_NAME}, журнал: ${LOG_FILE}" "${SCRIPT_NAME}, log: ${LOG_FILE}")"
     ensure_packages
     load_py_helper
-    conf_load
 
     resolve_install_mode
     resolve_base_answers
-    converge "nginx: порт 80" http
-    converge "Сертификат" cert
+    converge "$(L "nginx: порт 80" "nginx: port 80")" http
+    converge "$(L "Сертификат" "Certificate")" cert
     resolve_import
     resolve_xui_version
     converge "3x-ui" xui
     resolve_xhttp
     resolve_xhttp_port
+    resolve_hy2
     resolve_paths
     resolve_credentials
     converge "nginx" nginx
-    converge "Панель 3x-ui" panel
-    converge "Подписка" subscription
-    resolve_hy2
+    converge "$(L "Панель 3x-ui" "3x-ui panel")" panel
+    converge "$(L "Подписка" "Subscription")" subscription
     resolve_client_name
-    converge "Инбаунды" inbounds
-    converge "Хосты" hosts
-    converge "Маршрутизация" routing
+    converge "$(L "Инбаунды" "Inbounds")" inbounds
+    converge "$(L "Хосты" "Hosts")" hosts
+    converge "$(L "Маршрутизация" "Routing")" routing
     converge "ufw" ufw
-    step "Проверка"
-    final_checks || die "проверка не пройдена"
+    step "$(L "Проверка" "Check")"
+    final_checks || die "$(L "проверка не пройдена" "check failed")"
     step_end
-    converge "ufw: лишние правила" ufw_cleanup
+    converge "$(L "ufw: лишние правила" "ufw: extra rules")" ufw_cleanup
     print_summary
 }
 

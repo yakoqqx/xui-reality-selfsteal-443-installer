@@ -13,14 +13,12 @@
 
 The script installs the 3x-ui panel on a VPS and sets up VLESS Reality on 443/tcp in selfsteal (steal_oneself) mode: Reality is disguised as the server's own website with its own certificate, without borrowing someone else's domain. From the outside, the server looks like an ordinary website with its own domain. VLESS XHTTP and Hysteria2 are optional. All protocols reach the client through a single subscription link. The Let's Encrypt certificate, nginx, routing and ufw are configured during installation. The server is built from scratch or moved from another server together with its `x-ui.db` database.
 
-> The script's prompts and messages are in Russian.
-
 ## Requirements
 
 - Ubuntu 24.04, root or sudo access.
 - A domain or subdomain with an A record pointing to the server's IP.
 - Free ports 80/tcp and 443/tcp.
-- ufw is configured automatically. With a different firewall, 80/tcp, 443/tcp, SSH and the Hysteria2 UDP port need to be open there.
+- ufw is configured automatically. With a different firewall, 80/tcp, 443/tcp, 443/udp and SSH need to be open there.
 
 ## Installation
 
@@ -29,7 +27,7 @@ wget -O install.sh https://raw.githubusercontent.com/yakoqqx/xui-reality-selfste
 sudo bash install.sh
 ```
 
-The first run offers a choice of installation:
+The first run asks for the language (Russian or English) and the type of installation:
 
 - **Standard** — VLESS Reality on 443 only. The domain and email are needed, everything else is filled in automatically.
 - **Extended** — XHTTP and Hysteria2 on top, custom paths, panel username and password, moving an `x-ui.db` database.
@@ -78,10 +76,10 @@ The nginx and fail2ban packages are removed after a separate question. curl, ope
                             /<XHTTP path>           Xray XHTTP 127.0.0.1:8081 (optional)
                             /<subscription path>    subscription 127.0.0.1:2096
                             /<panel path>           3x-ui panel 127.0.0.1:2053
-<port>/udp     → Hysteria2 (optional)
+443/udp        → Hysteria2 (optional)
 ```
 
-Only 80/tcp, 443/tcp, SSH and the Hysteria2 UDP port are open from the outside.
+Only 80/tcp, 443/tcp, 443/udp and SSH are open from the outside.
 
 ## What gets configured
 
@@ -93,11 +91,11 @@ Only 80/tcp, 443/tcp, SSH and the Hysteria2 UDP port are open from the outside.
 | 3x-ui ads | Always off: nginx returns an empty list for `/<panel path>/sponsors` and 404 for `/<panel path>/sponsors/`. |
 | VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI is the domain, xver 0. |
 | VLESS XHTTP | Optional. `127.0.0.1`, `stream-one` mode. In the subscription: `<domain>:443`, TLS, ALPN `h2`, fingerprint `firefox`. Default port 8081. |
-| Hysteria2 | Optional. UDP, domain certificate, ALPN `h3`, Salamander. Default port 443/udp. |
+| Hysteria2 | Optional. 443/udp, domain certificate, ALPN `h3`, no obfuscation, masquerade `proxy` to `https://<domain>:443`, `rejectUnknownSni`. The site gets the `Alt-Svc` header. |
 | Sniffing | On Reality, XHTTP and Hysteria2: `http`, `tls`, `quic`, `routeOnly`. The domain found in traffic is used for routing only, the destination address is not replaced. |
 | Routing | Private and Russian IP addresses (`geoip:private`, `ext:geoip_RU.dat:ru`), BitTorrent, domains from `ext:geosite_RU.dat:ru-available-only-inside`, the `.ru`, `.su`, `.рф` zones, ads (`category-ads-all`) and UDP/443 on Reality and XHTTP are blocked. Existing rules are kept, missing ones are added. |
 | Subscription | `127.0.0.1:2096`, link format `https://<domain>/<subscription path>/`. Rows are named after Hosts: `VLESS-TCP`, `VLESS-XHTTP`, `HYSTERIA2`. |
-| ufw | SSH (the port is taken from the running sshd or ssh.socket), 80/tcp, 443/tcp, the Hysteria2 UDP port. |
+| ufw | SSH (the port is taken from the running sshd or ssh.socket), 80/tcp, 443/tcp, 443/udp. |
 
 Custom directives for the panel go into `/etc/nginx/snippets/xui-panel*.conf`. These files are included in the config and stay untouched on re-runs.
 
@@ -111,9 +109,9 @@ Questions in order:
 2. Path to `x-ui.db` — for moving a database, left empty for a fresh install.
 3. 3x-ui version, if a newer one than the tested version is out.
 4. VLESS XHTTP and its internal port.
-5. Secret paths for XHTTP, the subscription and the panel.
-6. Panel username and password.
-7. Hysteria2 and its port.
+5. Hysteria2.
+6. Secret paths for XHTTP, the subscription and the panel.
+7. Panel username and password.
 8. First client's name.
 
 Only the domain and email are required, everything else is generated if left empty.
@@ -121,8 +119,6 @@ Only the domain and email are required, everything else is generated if left emp
 A secret path is one or more parts separated by `/`, made of letters, digits, `-` and `_`. Paths must not match or be nested in each other.
 
 The internal XHTTP port is 8081 by default, 1024–65535 allowed.
-
-The Hysteria2 port is 443 by default, `r` picks a random one in 20000–60000. Not allowed: 51820, 1194, 500, 4500, 1723; 1–1023 except 443; 7443, 2053, 2096, 62789; the XHTTP and SSH ports; UDP ports in use.
 
 ## Moving x-ui.db
 
@@ -138,8 +134,8 @@ Clients, the panel username and password, and secret paths are taken from the da
 
 - Reality is moved to 443, target `127.0.0.1:7443`, SNI is the domain; non-zero `limitFallback*` are removed. x25519 keys and shortIds are kept if Reality was already set up the same way, otherwise new ones are issued. If several Reality inbounds are enabled, the script stops and lists them.
 - Other inbounds on public TCP ports are disabled.
-- If the database has no XHTTP or Hysteria2, the script offers to add them. For Hysteria2 it asks whether to keep the current port.
-- Hosts get the domain as the address, port 443 (Reality, XHTTP) and the Hysteria2 port. Hosts with another address are left as they are.
+- If the database has no XHTTP or Hysteria2, the script offers to add them. Hysteria2 is moved to 443/udp without obfuscation.
+- Hosts get the domain as the address and port 443. Hosts with another address are left as they are.
 - `externalProxy` is removed: links are built from Hosts.
 - Tags in routing rules, `subURI` and ufw rules are updated.
 - The panel username and password stay the same or new ones are set.
@@ -151,8 +147,8 @@ A database from a newer 3x-ui version than the installed one is not moved: the s
 
 At the end of installation and with `--check`, the script verifies that:
 
-- Only Xray listens on 443/tcp, nginx on `127.0.0.1:7443` and 80/tcp, Hysteria2 on its UDP port.
-- In `config.json` Reality is on 443 with target `127.0.0.1:7443`, has no non-zero `limitFallback`, inbounds have sniffing, and the blocking and UDP/443 rules are in place.
+- Only Xray listens on 443/tcp, nginx on `127.0.0.1:7443` and 80/tcp, Hysteria2 on 443/udp.
+- In `config.json` Reality is on 443 with target `127.0.0.1:7443`, has no non-zero `limitFallback`, Hysteria2 has no obfuscation, inbounds have sniffing, and the blocking and UDP/443 rules are in place.
 - There are no connections to `127.0.0.1:443`.
 - `127.0.0.1:7443` answers with TLS 1.3 and h2 using the domain certificate and rejects connections without SNI.
 - Public 443 rejects connections without SNI or with a foreign SNI and serves the certificate for the domain.
