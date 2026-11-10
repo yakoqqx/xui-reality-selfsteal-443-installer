@@ -87,14 +87,14 @@ Only 80/tcp, 443/tcp, 443/udp and SSH are open from the outside.
 |---|---|
 | Certificate | Let's Encrypt via acme.sh, ECDSA, HTTP-01 challenge through nginx (webroot `/var/www/acme`). Renewed by `/usr/local/sbin/cert-renew.sh`: cron runs it daily, and the certificate is renewed when less than 30 days are left. |
 | nginx | Listens on `127.0.0.1:7443`, TLS 1.3 and h2. Connections without SNI or with a foreign SNI are rejected (`ssl_reject_handshake`). XHTTP (`grpc_pass`), the subscription and the panel (`proxy_pass`, WebSocket) live on secret paths, everything else is the decoy site. On 80/tcp the domain is redirected to https, other requests get 444. |
-| 3x-ui | The panel listens on `127.0.0.1:2053` and is reachable only through nginx. The version tested with the script is installed; a newer one can be chosen in the extended installation. |
+| 3x-ui | The panel listens on `127.0.0.1:2053` and is reachable only through nginx. The version tested with the script is installed; a newer one can be chosen in the extended installation. Files of the tested version are verified against SHA-256 sums built into the script. |
 | 3x-ui ads | Always off: nginx returns an empty list for `/<panel path>/sponsors` and 404 for `/<panel path>/sponsors/`. |
 | VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI is the domain, xver 0. |
 | VLESS XHTTP | Optional. `127.0.0.1`, `stream-one` mode. In the subscription: `<domain>:443`, TLS, ALPN `h2`, fingerprint `firefox`. Default port 8081. |
-| Hysteria2 | Optional. 443/udp, domain certificate, ALPN `h3`, no obfuscation, masquerade `proxy` to `https://<domain>:443`, `rejectUnknownSni`. The site gets the `Alt-Svc` header. |
+| Hysteria2 | Optional. 443/udp, domain certificate, ALPN `h3`, no obfuscation, masquerade `proxy` to `https://<domain>:443`, `rejectUnknownSni`. The site and the subscription send the `Alt-Svc: h3=":443"` header, which announces HTTP/3 on 443/udp. |
 | Sniffing | On Reality, XHTTP and Hysteria2: `http`, `tls`, `quic`, `routeOnly`. The domain found in traffic is used for routing only, the destination address is not replaced. |
 | Routing | Private and Russian IP addresses (`geoip:private`, `ext:geoip_RU.dat:ru`), BitTorrent, domains from `ext:geosite_RU.dat:ru-available-only-inside`, the `.ru`, `.su`, `.рф` zones, ads (`category-ads-all`) and UDP/443 on Reality and XHTTP are blocked. Existing rules are kept, missing ones are added. |
-| Subscription | `127.0.0.1:2096`, link format `https://<domain>/<subscription path>/`. Rows are named after Hosts: `VLESS-TCP`, `VLESS-XHTTP`, `HYSTERIA2`. |
+| Subscription | `127.0.0.1:2096`, link format `https://<domain>/<subscription path>/`. Rows are named after Hosts: `VLESS-TCP`, `VLESS-XHTTP`, `HYSTERIA2`. The response gets the `socks-auth-mode: auto` and `http-auth-mode: auto` headers: Happ sets the username and password of its local proxies on its own. |
 | ufw | SSH (the port is taken from the running sshd or ssh.socket), 80/tcp, 443/tcp, 443/udp. |
 
 Custom directives for the panel go into `/etc/nginx/snippets/xui-panel*.conf`. These files are included in the config and stay untouched on re-runs.

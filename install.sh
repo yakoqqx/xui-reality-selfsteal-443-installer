@@ -14,6 +14,14 @@ XUI_DB="/etc/x-ui/x-ui.db"
 XUI_INSTALL_RESULT="/etc/x-ui/install-result.env"
 XRAY_CONFIG="/usr/local/x-ui/bin/config.json"
 XUI_SUPPORTED_VERSION="v3.11.0"
+declare -A XUI_SHA256=(
+    [install.sh]="9684bae4f769b2127fcceceb4f200045657381311867529e6ba76c6b58e2825d"
+    [x-ui.sh]="26c229d5fb3b184e81581b4b223b801582ca7cf5908aaedeb8d1c7c70ad4cc25"
+    [x-ui-amd64]="fb7b3776334fce69299f90168c8c31377b69f89c7787088e6dbf561d07b3d345"
+    [xray-amd64]="a27e3f95ab6ce270956d0cecd32eda4686a811afc71c64a6a734a3dede14883e"
+    [x-ui-arm64]="053f4c0da86d6b6aff41af2aa7b579a62ebc3105ef5eac77fee5b79ab9a2a8a4"
+    [xray-arm64]="dc3324f437132d70d29ddadea19b202949c2d1230b5d90dac469b03f68829c8b"
+)
 XUI_REPO="MHSanaei/3x-ui"
 SPONSORS_EMPTY='{"success":true,"msg":"","obj":{"sponsors":[]}}'
 ACME="/root/.acme.sh/acme.sh"
@@ -24,6 +32,7 @@ NGINX_CONF_D="/etc/nginx/conf.d"
 NGINX_REJECT_CONF="${NGINX_CONF_D}/00-reject-unknown-sni.conf"
 NGINX_HTTP_REJECT_CONF="${NGINX_CONF_D}/00-http-reject.conf"
 NGINX_PANEL_SNIPPETS="/etc/nginx/snippets/xui-panel*.conf"
+NGINX_STUB_SNIPPETS="/etc/nginx/snippets/site-*.conf"
 ACME_WEBROOT="/var/www/acme"
 
 PUBLIC_TLS_PORT=443
@@ -48,7 +57,7 @@ NAME_RE='^[A-Za-z0-9_-]+$'
 USERNAME_RE='^[A-Za-z0-9_.-]{3,32}$'
 
 CONF_KEYS=(LANGUAGE INSTALL_MODE DOMAIN CERT_FOLDER ACME_EMAIL XHTTP XHTTP_PORT XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH
-    XUI_CREDENTIALS_PENDING HY2 CLIENT_NAME)
+    XUI_CREDENTIALS_PENDING XUI_VERIFY_PENDING HY2 CLIENT_NAME)
 declare -A CONF=()
 
 RECONFIGURE=0
@@ -1760,15 +1769,31 @@ curl_exit_code() {
 
 # 3X-UI: СЛУЖБА, БАЗА, API
 
-xray_bin() {
-    local arch
+xui_arch() {
     case "$(uname -m)" in
-        x86_64 | amd64) arch=amd64 ;;
-        aarch64 | arm64) arch=arm64 ;;
+        x86_64 | amd64) printf 'amd64' ;;
+        aarch64 | arm64) printf 'arm64' ;;
         *) return 1 ;;
     esac
+}
+
+xray_bin() {
+    local arch
+    arch=$(xui_arch) || return 1
     [[ -x "/usr/local/x-ui/bin/xray-linux-${arch}" ]] || return 1
     printf '%s' "/usr/local/x-ui/bin/xray-linux-${arch}"
+}
+
+sha256_of() {
+    sha256sum "$1" 2> /dev/null | awk '{print $1}'
+}
+
+xui_sum_mismatches() {
+    local arch item
+    arch=$(xui_arch) || return 0
+    for item in "x-ui-${arch}:${XUI_BIN}" "xray-${arch}:/usr/local/x-ui/bin/xray-linux-${arch}" "x-ui.sh:/usr/bin/x-ui"; do
+        [[ "$(sha256_of "${item#*:}")" == "${XUI_SHA256[${item%%:*}]}" ]] || printf '%s\n' "${item#*:}"
+    done
 }
 
 xui_has_config() {
@@ -2545,7 +2570,7 @@ apply_cert() {
 # УСТАНОВКА 3X-UI И ПЕРЕНОС БАЗЫ
 
 check_xui() {
-    local rc=0 version
+    local rc=0 version file
     if [[ ! -x "$XUI_BIN" ]]; then
         mismatch "$(L "3x-ui не установлен" "3x-ui is not installed")"
         return 1
@@ -2554,6 +2579,15 @@ check_xui() {
     log "3x-ui ${version}"
     if [[ "$version" != "$XUI_SUPPORTED_VERSION" ]]; then
         warn_lines <<< "$(L "3x-ui ${version}: со скриптом проверена ${XUI_SUPPORTED_VERSION}" "3x-ui ${version}: the script is tested with ${XUI_SUPPORTED_VERSION}")"
+    fi
+    [[ -n "$(conf_get XUI_VERIFY_PENDING)" ]] && {
+        mismatch "$(L "файлы 3x-ui не сверены с суммами SHA-256 из скрипта" "3x-ui files are not verified against the SHA-256 sums from the script")"
+        rc=1
+    }
+    if [[ "$CHECK_ONLY" -eq 1 && "$version" == "$XUI_SUPPORTED_VERSION" ]]; then
+        while IFS= read -r file; do
+            [[ -n "$file" ]] && report_warn "$(L "SHA-256 ${file} отличается от суммы 3x-ui ${version} из скрипта" "SHA-256 of ${file} differs from the 3x-ui ${version} sum in the script")"
+        done < <(xui_sum_mismatches)
     fi
     [[ -n "$IMPORT_DB" ]] && {
         mismatch "$(L "ожидается перенос базы ${IMPORT_DB}" "database move ${IMPORT_DB} is pending")"
@@ -2608,7 +2642,7 @@ resolve_xui_version() {
 }
 
 install_xui() {
-    local installer version="${XUI_VERSION:-$XUI_SUPPORTED_VERSION}"
+    local installer sum version="${XUI_VERSION:-$XUI_SUPPORTED_VERSION}"
     log "$(L "Установка 3x-ui ${version} (1–3 минуты)" "Installing 3x-ui ${version} (1–3 minutes)")"
     installer=$(mktemp)
     if ! curl -fsSL "https://raw.githubusercontent.com/${XUI_REPO}/${version}/install.sh" -o "$installer"; then
@@ -2616,12 +2650,40 @@ install_xui() {
         log "$(L "Не удалось скачать установщик 3x-ui ${version}" "Failed to download the 3x-ui installer ${version}")"
         return 1
     fi
+    if [[ "$version" == "$XUI_SUPPORTED_VERSION" ]]; then
+        sum=$(sha256_of "$installer")
+        if [[ "$sum" != "${XUI_SHA256[install.sh]}" ]]; then
+            rm -f "$installer"
+            log "$(L "SHA-256 установщика 3x-ui ${version} не совпадает с суммой из скрипта, 3x-ui не установлен" "SHA-256 of the 3x-ui installer ${version} does not match the sum in the script, 3x-ui is not installed")"
+            log "$(L "  получено: ${sum}" "  received: ${sum}")"
+            log "$(L "  ожидалось: ${XUI_SHA256[install.sh]}" "  expected: ${XUI_SHA256[install.sh]}")"
+            return 1
+        fi
+        conf_set XUI_VERIFY_PENDING "$version"
+    else
+        log_quiet "$(L "Суммы SHA-256 для 3x-ui ${version} в скрипт не зашиты, архив сверяется с файлом .sha256 релиза." "SHA-256 sums for 3x-ui ${version} are not built into the script, the archive is verified against the release .sha256 file.")"
+    fi
     bash "$installer" "$version" < /dev/null >> "$LOG_FILE" 2>&1
     rm -f "$installer"
     [[ -x "$XUI_BIN" ]] || {
         log "$(L "Установка 3x-ui завершилась с ошибкой" "3x-ui installation failed")"
         return 1
     }
+}
+
+verify_xui_files() {
+    local bad
+    [[ -n "$(conf_get XUI_VERIFY_PENDING)" ]] || return 0
+    bad=$(xui_sum_mismatches)
+    if [[ -n "$bad" ]]; then
+        systemctl disable x-ui > /dev/null 2>&1 || true
+        xui_stop
+        log "$(L "SHA-256 файлов 3x-ui $(conf_get XUI_VERIFY_PENDING) не совпадает с суммами из скрипта, x-ui остановлен:" "SHA-256 of 3x-ui $(conf_get XUI_VERIFY_PENDING) files does not match the sums in the script, x-ui is stopped:")"
+        log_lines "  " <<< "$bad"
+        return 1
+    fi
+    conf_unset XUI_VERIFY_PENDING
+    log "$(L "Файлы 3x-ui сверены с суммами SHA-256 из скрипта" "3x-ui files verified against the SHA-256 sums from the script")"
 }
 
 import_db() {
@@ -2676,6 +2738,7 @@ apply_xui() {
         install_xui || return 1
         XUI_INSTALLED_NOW=1
     fi
+    verify_xui_files || return 1
     if [[ -n "$IMPORT_DB" ]]; then
         import_db "$IMPORT_DB" || return 1
         IMPORT_DB=""
@@ -2738,10 +2801,18 @@ render_nginx_xhttp_location() {
 EOF
 }
 
+site_stub_includes() {
+    awk '
+        depth == 1 && /^[ \t]*include[ \t]+(\/etc\/nginx\/)?snippets\/site-[^ \t;]*\.conf[ \t]*;[ \t]*$/ { print }
+        { depth += gsub(/\{/, "{") - gsub(/\}/, "}") }
+    ' "$(nginx_site_file)" 2> /dev/null
+}
+
 render_nginx_site() {
-    local domain folder
+    local domain folder stub
     domain=$(conf_get DOMAIN)
     folder=$(conf_get CERT_FOLDER)
+    stub=$(site_stub_includes)
     printf 'server {\n'
     nginx_listen_lines ""
     [[ "$(hy2_port_answer)" != 0 ]] && printf '%s\n' "$ALT_SVC_LINE"
@@ -2768,6 +2839,11 @@ EOF
         proxy_pass         http://127.0.0.1:${SUB_PORT};
         proxy_set_header   Host      \$host;
         proxy_set_header   X-Real-IP \$remote_addr;
+        add_header         socks-auth-mode auto;
+        add_header         http-auth-mode  auto;
+EOF
+    [[ "$(hy2_port_answer)" != 0 ]] && printf '    %s\n' "$ALT_SVC_LINE"
+    cat << EOF
     }
 
     location = $(conf_get PANEL_PATH)/sponsors {
@@ -2791,6 +2867,12 @@ EOF
         include            ${NGINX_PANEL_SNIPPETS};
     }
 
+EOF
+    if [[ -n "$stub" ]]; then
+        printf '%s\n}\n' "$stub"
+        return 0
+    fi
+    cat << EOF
     location / {
         try_files \$uri \$uri/ /index.html;
     }
@@ -2851,6 +2933,7 @@ nginx_remove_stale_rejects() {
 
 stub_ready() {
     local dir
+    [[ -n "$(site_stub_includes)" ]] && return 0
     dir=$(www_dir)
     [[ -s "${dir}/index.html" ]] && compgen -G "${dir}/favicon.*" > /dev/null
 }
@@ -2965,10 +3048,11 @@ nginx_apply() {
 }
 
 nginx_write_tls_files() {
-    local site
+    local site content
     site=$(nginx_site_file)
     nginx_remove_stale_rejects
-    render_nginx_site > "$site"
+    content=$(render_nginx_site)
+    printf '%s\n' "$content" > "$site"
     render_nginx_reject > "$NGINX_REJECT_CONF"
     ln -sfn "$site" "$(nginx_site_link)"
     rm -f "${NGINX_SITES_ENABLED}/default"
@@ -2983,7 +3067,7 @@ alt_svc_count() {
 }
 
 check_nginx() {
-    local rc=0 site addr expected has_local=0
+    local rc=0 site addr expected has_local=0 header alt_svc=0
     if ! command -v nginx > /dev/null 2>&1; then
         mismatch "$(L "nginx не установлен" "nginx is not installed")"
         return 1
@@ -2993,9 +3077,18 @@ check_nginx() {
         template_differs "$(L "конфигурация сайта" "site configuration")" "$site"
         rc=1
     }
-    if [[ -e "$site" ]] && [[ "$(alt_svc_count "$site")" != "$([[ "$(hy2_port_answer)" != 0 ]] && echo 1 || echo 0)" ]]; then
-        mismatch "$(L "Alt-Svc в ${site}: строк $(alt_svc_count "$site"), нужно $([[ "$(hy2_port_answer)" != 0 ]] && echo 1 || echo 0)" "Alt-Svc in ${site}: $(alt_svc_count "$site") lines, expected $([[ "$(hy2_port_answer)" != 0 ]] && echo 1 || echo 0)")"
-        rc=1
+    [[ "$(hy2_port_answer)" != 0 ]] && alt_svc=2
+    if [[ -e "$site" ]]; then
+        if [[ "$(alt_svc_count "$site")" != "$alt_svc" ]]; then
+            mismatch "$(L "Alt-Svc в ${site}: строк $(alt_svc_count "$site"), нужно ${alt_svc}" "Alt-Svc in ${site}: $(alt_svc_count "$site") lines, expected ${alt_svc}")"
+            rc=1
+        fi
+        for header in socks-auth-mode http-auth-mode; do
+            grep -qiE "^[[:space:]]*add_header[[:space:]]+${header}[[:space:]]+auto[[:space:]]*;" "$site" || {
+                mismatch "$(L "в ${site} нет заголовка ${header} в location подписки" "${site} has no ${header} header in the subscription location")"
+                rc=1
+            }
+        done
     fi
     [[ "$(readlink -f "$(nginx_site_link)")" == "$site" ]] || {
         mismatch_minor "$(L "сайт ${site} не подключён в ${NGINX_SITES_ENABLED}" "site ${site} is not enabled in ${NGINX_SITES_ENABLED}")"
@@ -3927,7 +4020,7 @@ uninstall_xui() {
         systemctl restart fail2ban > /dev/null 2>&1
     fi
     conf_unset XHTTP XHTTP_PORT XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH \
-        XUI_CREDENTIALS_PENDING HY2 CLIENT_NAME
+        XUI_CREDENTIALS_PENDING XUI_VERIFY_PENDING HY2 CLIENT_NAME
 }
 
 uninstall_nginx() {
@@ -3991,7 +4084,7 @@ uninstall_rest() {
     if [[ -z "$(installed_packages nginx)" ]]; then
         rmdir /var/www 2> /dev/null && log "$(L "удалён /var/www" "removed /var/www")"
     fi
-    kept=$(compgen -G '/etc/nginx/snippets/xui-panel*.conf' | tr '\n' ' ')
+    kept=$({ compgen -G "$NGINX_PANEL_SNIPPETS"; compgen -G "$NGINX_STUB_SNIPPETS"; } | tr '\n' ' ')
     [[ -n "$kept" ]] && log "$(L "оставлены файлы пользователя: ${kept% }" "user files kept: ${kept% }")"
     LOG_FILE=/dev/null
     rm -f "$log_file"
@@ -4157,6 +4250,7 @@ print_summary() {
     if grep -qF '<title>403 Forbidden</title>' "$(www_dir)/index.html" 2> /dev/null; then
         log ""
         log "$(L "Сейчас на сайте страница 403. Свою заглушку — index.html и фавиконку — можно положить в $(www_dir)/" "The site now shows a 403 page. A custom decoy — index.html and a favicon — can be placed in $(www_dir)/")"
+        log "$(L "Заглушка — обычный небольшой сайт по теме домена: статические файлы в этой папке, без упоминаний VPN и прокси." "A decoy is an ordinary small site that fits the domain: static files in this folder, no mentions of VPN or proxy.")"
     fi
     return 0
 }
