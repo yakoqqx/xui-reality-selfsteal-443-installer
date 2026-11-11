@@ -4,8 +4,7 @@
 
 **Install script for 3x-ui and Xray on a VPS with VLESS Reality selfsteal (steal_oneself) on 443, XHTTP and Hysteria2**
 
-[![Русский](https://img.shields.io/badge/%D0%A0%D1%83%D1%81%D1%81%D0%BA%D0%B8%D0%B9-555555?style=for-the-badge)](README.md)
-[![English](https://img.shields.io/badge/English-2ea44f?style=for-the-badge)](README.en.md)
+<a href="README.md"><kbd>Русский</kbd></a> <kbd><b>English</b></kbd>
 
 </div>
 
@@ -43,22 +42,6 @@ Check the server without changing anything:
 ```bash
 sudo bash install.sh --check
 ```
-
-Remove what the script installed, fully or in parts:
-
-```bash
-sudo bash install.sh --uninstall
-```
-
-| Item | What is removed |
-|---|---|
-| 1 | 3x-ui: the x-ui service, `/usr/local/x-ui`, `/etc/x-ui`, `/var/log/x-ui`, fail2ban jail `3x-ipl`. The database is copied to `/root/x-ui.db.<date>` first. |
-| 2 | nginx configs created by the script: site, anti-scan, port 80. |
-| 3 | Certificate `/etc/ssl/<folder>`, the domain in acme.sh, `cert-renew.sh` and the cron job. acme.sh itself is removed only if it holds no other domains. |
-| 4 | ufw rules added by the script. The SSH rule stays. |
-| 5 | Everything above, plus the decoy site, answers file, log and `/root/nginx-*.tgz` archives. |
-
-The nginx and fail2ban packages are removed after a separate question. curl, openssl, python3, sqlite3, cron and `/etc/nginx/snippets/xui-panel*.conf` files are not removed.
 
 ## Layout
 
@@ -100,6 +83,24 @@ Only 80/tcp, 443/tcp, 443/udp and SSH are open from the outside.
 Custom directives for the panel go into `/etc/nginx/snippets/xui-panel*.conf`. These files are included in the config and stay untouched on re-runs.
 
 A custom decoy site is `index.html` and `favicon.ico`, `.svg` or `.png` in `/var/www/<domain>/`. Without them, a 403 page is served.
+
+## Removal
+
+Remove what the script installed, fully or in parts:
+
+```bash
+sudo bash install.sh --uninstall
+```
+
+| Item | What is removed |
+|---|---|
+| 1 | 3x-ui: the x-ui service, `/usr/local/x-ui`, `/etc/x-ui`, `/var/log/x-ui`, fail2ban jail `3x-ipl`. The database is copied to `/root/x-ui.db.<date>` first. |
+| 2 | nginx configs created by the script: site, anti-scan, port 80. |
+| 3 | Certificate `/etc/ssl/<folder>`, the domain in acme.sh, `cert-renew.sh` and the cron job. acme.sh itself is removed only if it holds no other domains. |
+| 4 | ufw rules added by the script. The SSH rule stays. |
+| 5 | Everything above, plus the decoy site, answers file, log and `/root/nginx-*.tgz` archives. |
+
+The nginx and fail2ban packages are removed after a separate question. curl, openssl, python3, sqlite3, cron and `/etc/nginx/snippets/xui-panel*.conf` files are not removed.
 
 ## Extended installation
 

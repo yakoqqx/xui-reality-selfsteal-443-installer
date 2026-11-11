@@ -4,8 +4,7 @@
 
 **Скрипт установки 3x-ui и Xray на VPS с VLESS Reality selfsteal (steal_oneself) на 443, XHTTP и Hysteria2**
 
-[![Русский](https://img.shields.io/badge/%D0%A0%D1%83%D1%81%D1%81%D0%BA%D0%B8%D0%B9-2ea44f?style=for-the-badge)](README.md)
-[![English](https://img.shields.io/badge/English-555555?style=for-the-badge)](README.en.md)
+<kbd><b>Русский</b></kbd> <a href="README.en.md"><kbd>English</kbd></a>
 
 </div>
 
@@ -43,22 +42,6 @@ sudo bash install.sh --reconfigure
 ```bash
 sudo bash install.sh --check
 ```
-
-Удалить то, что поставил скрипт, целиком или по частям:
-
-```bash
-sudo bash install.sh --uninstall
-```
-
-| Пункт | Что удаляется |
-|---|---|
-| 1 | 3x-ui: служба x-ui, `/usr/local/x-ui`, `/etc/x-ui`, `/var/log/x-ui`, jail fail2ban `3x-ipl`. Перед удалением база копируется в `/root/x-ui.db.<дата>`. |
-| 2 | Конфиги nginx, которые создал скрипт: сайт, антискан, порт 80. |
-| 3 | Сертификат `/etc/ssl/<папка>`, домен в acme.sh, `cert-renew.sh` и задача cron. Сам acme.sh удаляется, только если других доменов в нём нет. |
-| 4 | Правила ufw, добавленные скриптом. Правило SSH остаётся. |
-| 5 | Всё перечисленное, а также сайт-заглушка, файл ответов, журнал и архивы `/root/nginx-*.tgz`. |
-
-Пакеты nginx и fail2ban удаляются по отдельному вопросу. curl, openssl, python3, sqlite3, cron и файлы `/etc/nginx/snippets/xui-panel*.conf` не удаляются.
 
 ## Схема
 
@@ -100,6 +83,24 @@ sudo bash install.sh --uninstall
 Свои директивы для панели кладутся в `/etc/nginx/snippets/xui-panel*.conf`. Эти файлы подключаются к конфигу и при повторных запусках не меняются.
 
 Свой сайт-заглушка — файлы `index.html` и `favicon.ico`, `.svg` или `.png` в `/var/www/<домен>/`. Если их нет, отдаётся страница 403.
+
+## Удаление
+
+Удалить то, что поставил скрипт, целиком или по частям:
+
+```bash
+sudo bash install.sh --uninstall
+```
+
+| Пункт | Что удаляется |
+|---|---|
+| 1 | 3x-ui: служба x-ui, `/usr/local/x-ui`, `/etc/x-ui`, `/var/log/x-ui`, jail fail2ban `3x-ipl`. Перед удалением база копируется в `/root/x-ui.db.<дата>`. |
+| 2 | Конфиги nginx, которые создал скрипт: сайт, антискан, порт 80. |
+| 3 | Сертификат `/etc/ssl/<папка>`, домен в acme.sh, `cert-renew.sh` и задача cron. Сам acme.sh удаляется, только если других доменов в нём нет. |
+| 4 | Правила ufw, добавленные скриптом. Правило SSH остаётся. |
+| 5 | Всё перечисленное, а также сайт-заглушка, файл ответов, журнал и архивы `/root/nginx-*.tgz`. |
+
+Пакеты nginx и fail2ban удаляются по отдельному вопросу. curl, openssl, python3, sqlite3, cron и файлы `/etc/nginx/snippets/xui-panel*.conf` не удаляются.
 
 ## Расширенная установка
 
