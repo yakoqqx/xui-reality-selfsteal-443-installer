@@ -73,7 +73,7 @@ sudo bash install.sh --check
 | 3x-ui | Панель слушает `127.0.0.1:2053` и открывается только через nginx. Ставится версия, проверенная со скриптом; более новую можно выбрать при расширенной установке. Файлы проверенной версии сверяются с суммами SHA-256, зашитыми в скрипт. |
 | Реклама 3x-ui | Всегда отключена: nginx отдаёт на `/<путь панели>/sponsors` пустой список, на `/<путь панели>/sponsors/` — 404. |
 | VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI — домен, xver 1. |
-| VLESS XHTTP | Опционально. `127.0.0.1`, режим `stream-one`, `trustedXForwardedFor`: `X-Real-IP`. В подписке: `<домен>:443`, TLS, ALPN `h2`, fingerprint `firefox`. Порт по умолчанию 8081. |
+| VLESS XHTTP | Опционально. `127.0.0.1`, режим `stream-one`, `trustedXForwardedFor`: `X-Real-IP`. В подписке: `<домен>:443`, TLS, SNI — домен, ALPN `h2`, fingerprint `firefox`. Порт по умолчанию 8081. |
 | Hysteria2 | Опционально. 443/udp, сертификат домена, ALPN `h3`, без обфускации, masquerade `proxy` на `https://<домен>:443`, `rejectUnknownSni`. Сайт и подписка отдают заголовок `Alt-Svc: h3=":443"` — объявление HTTP/3 на 443/udp. |
 | Sniffing | На Reality, XHTTP и Hysteria2: `http`, `tls`, `quic`, `routeOnly`. Домен из трафика используется только для маршрутизации, адрес назначения не подменяется. |
 | Маршрутизация | Блокируются частные и российские IP-адреса (`geoip:private`, `ext:geoip_RU.dat:ru`), BitTorrent, домены из `ext:geosite_RU.dat:ru-available-only-inside`, зоны `.ru`, `.su`, `.рф`, реклама (`category-ads-all`) и UDP/443 на Reality и XHTTP. Свои правила сохраняются, недостающие дописываются. |

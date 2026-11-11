@@ -73,7 +73,7 @@ Only 80/tcp, 443/tcp, 443/udp and SSH are open from the outside.
 | 3x-ui | The panel listens on `127.0.0.1:2053` and is reachable only through nginx. The version tested with the script is installed; a newer one can be chosen in the extended installation. Files of the tested version are verified against SHA-256 sums built into the script. |
 | 3x-ui ads | Always off: nginx returns an empty list for `/<panel path>/sponsors` and 404 for `/<panel path>/sponsors/`. |
 | VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI is the domain, xver 1. |
-| VLESS XHTTP | Optional. `127.0.0.1`, `stream-one` mode, `trustedXForwardedFor`: `X-Real-IP`. In the subscription: `<domain>:443`, TLS, ALPN `h2`, fingerprint `firefox`. Default port 8081. |
+| VLESS XHTTP | Optional. `127.0.0.1`, `stream-one` mode, `trustedXForwardedFor`: `X-Real-IP`. In the subscription: `<domain>:443`, TLS, SNI is the domain, ALPN `h2`, fingerprint `firefox`. Default port 8081. |
 | Hysteria2 | Optional. 443/udp, domain certificate, ALPN `h3`, no obfuscation, masquerade `proxy` to `https://<domain>:443`, `rejectUnknownSni`. The site and the subscription send the `Alt-Svc: h3=":443"` header, which announces HTTP/3 on 443/udp. |
 | Sniffing | On Reality, XHTTP and Hysteria2: `http`, `tls`, `quic`, `routeOnly`. The domain found in traffic is used for routing only, the destination address is not replaced. |
 | Routing | Private and Russian IP addresses (`geoip:private`, `ext:geoip_RU.dat:ru`), BitTorrent, domains from `ext:geosite_RU.dat:ru-available-only-inside`, the `.ru`, `.su`, `.рф` zones, ads (`category-ads-all`) and UDP/443 on Reality and XHTTP are blocked. Existing rules are kept, missing ones are added. |

@@ -1080,12 +1080,15 @@ def desired_host(kind, domain, hy2_port):
         return {"address": domain, "port": REALITY_PORT, "security": "same", "sni": domain,
                 "override_sni_from_address": 0}
     if kind == "xhttp":
-        return {"address": domain, "port": REALITY_PORT, "security": "tls", "fingerprint": FINGERPRINT, "alpn": XHTTP_ALPN}
+        return {"address": domain, "port": REALITY_PORT, "security": "tls", "sni": domain, "fingerprint": FINGERPRINT,
+                "alpn": XHTTP_ALPN}
     return {"address": domain, "port": hy2_port, "security": "same"}
 
 
-def same_value(key, current, wanted, single_name=True):
-    if key == "sni" and single_name and (current or "") == "":
+def same_value(key, current, wanted, kind, single_name):
+    if key == "sni" and (current or "") == "":
+        return kind == "reality" and single_name
+    if key == "sni" and kind == "xhttp":
         return True
     if key == "override_sni_from_address":
         return enabled(current) == bool(wanted) if current not in (None, "") else not wanted
@@ -1132,7 +1135,7 @@ def cmd_hosts(mode, db, domain, hy2_port):
                                          f"{KIND_NAMES[kind]}: no Host {domain}:{wanted['port']}"))
             continue
         for host in own_hosts:
-            diffs = {k: v for k, v in wanted.items() if k in present and not same_value(k, host.get(k), v, single_name)}
+            diffs = {k: v for k, v in wanted.items() if k in present and not same_value(k, host.get(k), v, kind, single_name)}
             if not diffs:
                 continue
             text = ", ".join(f"{k} {host_value(k, host.get(k))} → {host_value(k, v)}" for k, v in diffs.items())
