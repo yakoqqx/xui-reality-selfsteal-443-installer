@@ -69,11 +69,11 @@ sudo bash install.sh --check
 | Компонент | Настройки |
 |---|---|
 | Сертификат | Let's Encrypt через acme.sh, ECDSA, проверка HTTP-01 через nginx (webroot `/var/www/acme`). Продлевает `/usr/local/sbin/cert-renew.sh`: cron запускает его каждый день, сертификат обновляется, когда до конца срока меньше 30 дней. |
-| nginx | Слушает `127.0.0.1:7443`, TLS 1.3 и h2. Подключения без SNI или с чужим SNI отклоняются (`ssl_reject_handshake`). По секретным путям доступны XHTTP (`grpc_pass`), подписка и панель (`proxy_pass`, WebSocket), остальное — сайт-заглушка. На 80/tcp домен получает редирект на https, остальные запросы — 444. |
+| nginx | Слушает `127.0.0.1:7443`, TLS 1.3 и h2. Адрес клиента приходит от Xray по PROXY protocol (`real_ip_header proxy_protocol`). Подключения без SNI или с чужим SNI отклоняются (`ssl_reject_handshake`). По секретным путям доступны XHTTP (`grpc_pass`), подписка и панель (`proxy_pass`, WebSocket), остальное — сайт-заглушка. На 80/tcp домен получает редирект на https, остальные запросы — 444. |
 | 3x-ui | Панель слушает `127.0.0.1:2053` и открывается только через nginx. Ставится версия, проверенная со скриптом; более новую можно выбрать при расширенной установке. Файлы проверенной версии сверяются с суммами SHA-256, зашитыми в скрипт. |
 | Реклама 3x-ui | Всегда отключена: nginx отдаёт на `/<путь панели>/sponsors` пустой список, на `/<путь панели>/sponsors/` — 404. |
-| VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI — домен, xver 0. |
-| VLESS XHTTP | Опционально. `127.0.0.1`, режим `stream-one`. В подписке: `<домен>:443`, TLS, ALPN `h2`, fingerprint `firefox`. Порт по умолчанию 8081. |
+| VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI — домен, xver 1. |
+| VLESS XHTTP | Опционально. `127.0.0.1`, режим `stream-one`, `trustedXForwardedFor`: `X-Real-IP`. В подписке: `<домен>:443`, TLS, ALPN `h2`, fingerprint `firefox`. Порт по умолчанию 8081. |
 | Hysteria2 | Опционально. 443/udp, сертификат домена, ALPN `h3`, без обфускации, masquerade `proxy` на `https://<домен>:443`, `rejectUnknownSni`. Сайт и подписка отдают заголовок `Alt-Svc: h3=":443"` — объявление HTTP/3 на 443/udp. |
 | Sniffing | На Reality, XHTTP и Hysteria2: `http`, `tls`, `quic`, `routeOnly`. Домен из трафика используется только для маршрутизации, адрес назначения не подменяется. |
 | Маршрутизация | Блокируются частные и российские IP-адреса (`geoip:private`, `ext:geoip_RU.dat:ru`), BitTorrent, домены из `ext:geosite_RU.dat:ru-available-only-inside`, зоны `.ru`, `.su`, `.рф`, реклама (`category-ads-all`) и UDP/443 на Reality и XHTTP. Свои правила сохраняются, недостающие дописываются. |
@@ -82,7 +82,7 @@ sudo bash install.sh --check
 
 Свои директивы для панели кладутся в `/etc/nginx/snippets/xui-panel*.conf`. Эти файлы подключаются к конфигу и при повторных запусках не меняются.
 
-Свой сайт-заглушка — файлы `index.html` и `favicon.ico`, `.svg` или `.png` в `/var/www/<домен>/`. Если их нет, отдаётся страница 403.
+Свой сайт-заглушка — файлы `index.html` и `favicon.ico`, `.svg` или `.png` в `/var/www/<домен>/`. Если их нет, отдаётся страница 403. Неизвестные пути отвечают 404.
 
 ## Удаление
 
@@ -95,7 +95,7 @@ sudo bash install.sh --uninstall
 | Пункт | Что удаляется |
 |---|---|
 | 1 | 3x-ui: служба x-ui, `/usr/local/x-ui`, `/etc/x-ui`, `/var/log/x-ui`, jail fail2ban `3x-ipl`. Перед удалением база копируется в `/root/x-ui.db.<дата>`. |
-| 2 | Конфиги nginx, которые создал скрипт: сайт, антискан, порт 80. |
+| 2 | Конфиги nginx, которые создал скрипт: сайт, антискан, real_ip, порт 80. |
 | 3 | Сертификат `/etc/ssl/<папка>`, домен в acme.sh, `cert-renew.sh` и задача cron. Сам acme.sh удаляется, только если других доменов в нём нет. |
 | 4 | Правила ufw, добавленные скриптом. Правило SSH остаётся. |
 | 5 | Всё перечисленное, а также сайт-заглушка, файл ответов, журнал и архивы `/root/nginx-*.tgz`. |
@@ -149,9 +149,9 @@ sudo bash install.sh --uninstall
 В конце установки и при `--check` проверяется:
 
 - 443/tcp слушает только Xray, nginx — `127.0.0.1:7443` и 80/tcp, Hysteria2 — 443/udp.
-- В `config.json` Reality на 443 с target `127.0.0.1:7443`, без ненулевых `limitFallback`, Hysteria2 без обфускации, sniffing на инбаундах, правила блокировки и UDP/443 на месте.
+- В `config.json` Reality на 443 с target `127.0.0.1:7443` и xver 1, без ненулевых `limitFallback`, Hysteria2 без обфускации, sniffing на инбаундах, правила блокировки и UDP/443 на месте.
 - Нет соединений на `127.0.0.1:443`.
-- `127.0.0.1:7443` отвечает TLS 1.3 и h2 с сертификатом домена и отклоняет подключения без SNI.
+- `127.0.0.1:7443` принимает PROXY protocol, отвечает TLS 1.3 и h2 с сертификатом домена и отклоняет подключения без SNI.
 - Публичный 443 отклоняет подключения без SNI и с чужим SNI, а на домен отдаёт сертификат.
 - Сайт, панель и подписка открываются через 443, в подписке есть все протоколы.
 - Запрос рекламы 3x-ui перехватывает nginx.
@@ -176,6 +176,7 @@ sudo bash install.sh --uninstall
 | `/root/xui-reality-selfsteal-443-installer.log` | журнал (0600) |
 | `/etc/nginx/sites-available/<домен>` | сайт |
 | `/etc/nginx/conf.d/00-reject-unknown-sni.conf` | антискан 127.0.0.1:7443 |
+| `/etc/nginx/conf.d/30-real-ip.conf` | адрес клиента из PROXY protocol |
 | `/etc/nginx/conf.d/00-http-reject.conf` | антискан 80/tcp |
 | `/etc/nginx/conf.d/10-http-<домен>.conf` | порт 80 домена |
 | `/var/www/acme/` | каталог проверок HTTP-01 |

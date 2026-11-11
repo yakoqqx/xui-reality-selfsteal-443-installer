@@ -31,6 +31,7 @@ NGINX_SITES_ENABLED="/etc/nginx/sites-enabled"
 NGINX_CONF_D="/etc/nginx/conf.d"
 NGINX_REJECT_CONF="${NGINX_CONF_D}/00-reject-unknown-sni.conf"
 NGINX_HTTP_REJECT_CONF="${NGINX_CONF_D}/00-http-reject.conf"
+NGINX_REAL_IP_CONF="${NGINX_CONF_D}/30-real-ip.conf"
 NGINX_PANEL_SNIPPETS="/etc/nginx/snippets/xui-panel*.conf"
 NGINX_STUB_SNIPPETS="/etc/nginx/snippets/site-*.conf"
 ACME_WEBROOT="/var/www/acme"
@@ -433,6 +434,8 @@ import uuid
 # НАСТРОЙКИ
 
 REALITY_PORT = 443
+REALITY_XVER = 1
+XHTTP_TRUSTED_HEADER = "X-Real-IP"
 XHTTP_LISTEN = "127.0.0.1"
 HY2_IDLE_TIMEOUT = 300
 FINGERPRINT = "firefox"
@@ -762,9 +765,9 @@ def normalize_reality(ib, domain, target):
     if isinstance(inner, dict) and inner.get("serverName") not in (None, "", domain):
         notes.append(f"settings.serverName {inner['serverName']} → {domain}")
         inner["serverName"] = domain
-    if as_int(rs.get("xver")) != 0:
-        notes.append(f"xver {rs.get('xver')} → 0")
-        rs["xver"] = 0
+    if as_int(rs.get("xver")) != REALITY_XVER:
+        notes.append(f"xver {rs.get('xver')} → {REALITY_XVER}")
+        rs["xver"] = REALITY_XVER
     for key in limit_fallback_active(rs):
         notes.append(L(f"{key} удалён", f"{key} removed"))
         del rs[key]
@@ -777,6 +780,11 @@ def normalize_reality(ib, domain, target):
         fields["listen"] = ""
     normalize_sniffing(ib, notes, fields)
     return stream, fields, notes
+
+
+def xhttp_trusted(sockopt):
+    trusted = sockopt.get("trustedXForwardedFor") if isinstance(sockopt, dict) else None
+    return isinstance(trusted, list) and any(str(h).lower() == XHTTP_TRUSTED_HEADER.lower() for h in trusted)
 
 
 def normalize_xhttp(ib, domain, path, port):
@@ -798,6 +806,15 @@ def normalize_xhttp(ib, domain, path, port):
         stream.pop("tlsSettings", None)
         stream.pop("realitySettings", None)
     drop_external_proxy(stream, notes)
+    sockopt = stream.get("sockopt") if isinstance(stream.get("sockopt"), dict) else {}
+    if not xhttp_trusted(sockopt):
+        trusted = sockopt.get("trustedXForwardedFor") if isinstance(sockopt.get("trustedXForwardedFor"), list) else []
+        notes.append(f"sockopt.trustedXForwardedFor {trusted} → {trusted + [XHTTP_TRUSTED_HEADER]}")
+        sockopt["trustedXForwardedFor"] = trusted + [XHTTP_TRUSTED_HEADER]
+        stream["sockopt"] = sockopt
+    if sockopt.get("acceptProxyProtocol"):
+        notes.append("sockopt.acceptProxyProtocol true → false")
+        sockopt["acceptProxyProtocol"] = False
     if (ib["listen"] or "").strip() != XHTTP_LISTEN:
         notes.append(f"listen {ib['listen'] or EMPTY} → {XHTTP_LISTEN}")
         fields["listen"] = XHTTP_LISTEN
@@ -889,6 +906,25 @@ def normalize_hy2(ib, domain, cert_folder, port):
         fields["port"] = port
     normalize_sniffing(ib, notes, fields)
     return stream, fields, notes
+
+
+def cmd_reality_xver(mode, db, target):
+    conn, cur = open_db(db)
+    pending = []
+    for ib in own_active(read_inbounds(cur), "reality"):
+        rs = ib["stream"].get("realitySettings")
+        if not isinstance(rs, dict) or (rs.get("target") or rs.get("dest")) != target:
+            continue
+        if as_int(rs.get("xver")) == REALITY_XVER:
+            continue
+        pending.append(f"VLESS Reality ({describe(ib)}): xver {rs.get('xver')} → {REALITY_XVER}")
+        if mode == "set":
+            rs["xver"] = REALITY_XVER
+            write_inbound(cur, ib["id"], ib["stream"], {})
+    if mode == "set":
+        conn.commit()
+    conn.close()
+    emit({"changes": pending})
 
 
 def unique_tag(port, transport, taken):
@@ -1117,16 +1153,6 @@ def cmd_hosts(mode, db, domain, hy2_port):
 
 # НАСТРОЙКИ ПАНЕЛИ
 
-def cmd_settings_get(db, key):
-    conn, cur = open_db(db)
-    try:
-        row = cur.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    except sqlite3.OperationalError:
-        row = None
-    conn.close()
-    print(row[0] if row and row[0] is not None else SETTING_DEFAULTS.get(key, ""))
-
-
 def cmd_settings_diff(db, *pairs):
     conn, cur = open_db(db)
     values = settings_map(cur)
@@ -1243,7 +1269,7 @@ def reality_inbound(p, clients, xray_bin):
         "streamSettings": {
             "network": "tcp", "security": "reality",
             "realitySettings": {
-                "show": False, "target": p["target"], "xver": 0,
+                "show": False, "target": p["target"], "xver": REALITY_XVER,
                 "serverNames": [p["domain"]], "privateKey": private, "shortIds": short_ids(),
                 "settings": {"publicKey": public, "fingerprint": FINGERPRINT, "spiderX": "/"},
             },
@@ -1258,6 +1284,7 @@ def xhttp_inbound(p, clients):
         "streamSettings": {
             "network": "xhttp", "security": "none",
             "xhttpSettings": {"path": p["xhttp_path"], "mode": "stream-one", "host": ""},
+            "sockopt": {"acceptProxyProtocol": False, "trustedXForwardedFor": [XHTTP_TRUSTED_HEADER]},
         },
     }
 
@@ -1398,9 +1425,13 @@ def cmd_config_summary(path):
             tls = stream.get("tlsSettings") if isinstance(stream.get("tlsSettings"), dict) else {}
             entry["plain"] = not fm.get("udp") and not fm.get("quicParams")
             entry["reject_sni"] = tls.get("rejectUnknownSni") is True
+        if kind == "xhttp":
+            sockopt = stream.get("sockopt") if isinstance(stream.get("sockopt"), dict) else {}
+            entry["real_ip"] = xhttp_trusted(sockopt) and not sockopt.get("acceptProxyProtocol")
         if kind == "reality":
             rs = stream.get("realitySettings") or {}
             entry["target"] = str(rs.get("target") or rs.get("dest") or "")
+            entry["xver"] = as_int(rs.get("xver"))
             entry["server_names"] = rs.get("serverNames") or []
             entry["limit_fallback"] = limit_fallback_active(rs)
         result[kind] = entry
@@ -1590,8 +1621,8 @@ COMMANDS = {
     "validate-db": cmd_validate_db,
     "import-prepare": cmd_import_prepare,
     "inbounds": cmd_inbounds,
+    "reality-xver": cmd_reality_xver,
     "hosts": cmd_hosts,
-    "settings-get": cmd_settings_get,
     "settings-diff": cmd_settings_diff,
     "settings-set": cmd_settings_set,
     "panel-user": cmd_panel_user,
@@ -1751,15 +1782,18 @@ tls_probe() {
 
 dest_ready() {
     local domain="$1" out
-    out=$(echo | timeout 6 openssl s_client -connect "$REALITY_TARGET" -servername "$domain" -tls1_3 -alpn h2 2>&1 | tr -d '\0')
-    grep -qa 'ALPN protocol: h2' <<< "$out" || return 1
-    grep -a 'subject=' <<< "$out" | grep -qF "$domain" || return 1
-    [[ "$(tls_probe "$NGINX_ADDR" "$NGINX_PORT" -)" == reject ]]
+    out=$(curl -sk --noproxy '*' --max-time 6 --haproxy-protocol --tlsv1.3 --http2 \
+        --resolve "${domain}:${NGINX_PORT}:${NGINX_ADDR}" -o /dev/null -w '%{http_version}\n%{certs}' \
+        "https://${domain}:${NGINX_PORT}/" 2> /dev/null)
+    [[ "$(head -n1 <<< "$out")" == 2 ]] || return 1
+    grep -ai '^subject:' <<< "$out" | grep -qF "$domain" || return 1
+    [[ "$(curl_exit_code -k --haproxy-protocol "https://${NGINX_ADDR}:${NGINX_PORT}/")" == 35 ]]
 }
 
 http_code() {
     local url="$1" resolve="$2"
-    curl -sk --noproxy '*' --max-time 10 --resolve "$resolve" -o /dev/null -w '%{http_code}' "$url"
+    shift 2
+    curl -sk --noproxy '*' --max-time 10 --resolve "$resolve" -o /dev/null -w '%{http_code}' "$@" "$url"
 }
 
 curl_exit_code() {
@@ -1806,10 +1840,6 @@ xui_discover() {
     else
         echo '{}'
     fi
-}
-
-setting_get() {
-    py settings-get "$XUI_DB" "$1"
 }
 
 journal_tail() {
@@ -2768,8 +2798,8 @@ nginx_http2_directive() {
 }
 
 nginx_listen_lines() {
-    local suffix="$1" params="ssl http2"
-    nginx_http2_directive && params="ssl"
+    local suffix="$1" params="proxy_protocol ssl http2"
+    nginx_http2_directive && params="proxy_protocol ssl"
     printf '    listen %s:%s %s%s;\n' "$NGINX_ADDR" "$NGINX_PORT" "$params" "$suffix"
     if nginx_http2_directive; then
         printf '    http2 on;\n'
@@ -2784,13 +2814,35 @@ render_nginx_reject() {
     printf '}\n'
 }
 
+render_nginx_real_ip() {
+    printf 'set_real_ip_from %s;\n' "$NGINX_ADDR"
+    printf 'real_ip_header proxy_protocol;\n'
+}
+
+nginx_foreign_real_ip() {
+    local depth f
+    {
+        printf '1 /etc/nginx/nginx.conf\n'
+        nginx_loaded_files | sed 's/^/0 /'
+    } | while read -r depth f; do
+        [[ "$(readlink -f "$f")" == "$NGINX_REAL_IP_CONF" ]] && continue
+        awk -v want="$depth" '
+            /^[ \t]*#/ { next }
+            depth == want && /^[ \t]*real_ip_header[ \t]/ { found = 1 }
+            { depth += gsub(/\{/, "{") - gsub(/\}/, "}") }
+            END { exit !found }
+        ' "$f" 2> /dev/null && printf '%s\n' "$f"
+    done
+    return 0
+}
+
 render_nginx_xhttp_location() {
     cat << EOF
     location $(conf_get XHTTP_PATH) {
         grpc_pass            grpc://127.0.0.1:$(xhttp_port);
         grpc_set_header      Host              \$host;
         grpc_set_header      X-Real-IP         \$remote_addr;
-        grpc_set_header      X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        grpc_set_header      X-Forwarded-For   \$remote_addr;
         grpc_set_header      X-Forwarded-Proto \$scheme;
         client_max_body_size 0;
         client_body_timeout  1h;
@@ -2874,7 +2926,7 @@ EOF
     fi
     cat << EOF
     location / {
-        try_files \$uri \$uri/ /index.html;
+        try_files \$uri \$uri/ =404;
     }
 }
 EOF
@@ -3007,7 +3059,7 @@ nginx_reload() {
 }
 
 nginx_managed_files() {
-    printf '%s\n' "$(nginx_site_file)" "$(nginx_site_link)" "$NGINX_REJECT_CONF" "$NGINX_HTTP_REJECT_CONF" \
+    printf '%s\n' "$(nginx_site_file)" "$(nginx_site_link)" "$NGINX_REJECT_CONF" "$NGINX_REAL_IP_CONF" "$NGINX_HTTP_REJECT_CONF" \
         "$(nginx_http_site_file)"
 }
 
@@ -3054,6 +3106,7 @@ nginx_write_tls_files() {
     content=$(render_nginx_site)
     printf '%s\n' "$content" > "$site"
     render_nginx_reject > "$NGINX_REJECT_CONF"
+    render_nginx_real_ip > "$NGINX_REAL_IP_CONF"
     ln -sfn "$site" "$(nginx_site_link)"
     rm -f "${NGINX_SITES_ENABLED}/default"
 }
@@ -3098,6 +3151,14 @@ check_nginx() {
         template_differs "$(L "антискан" "anti-scan")" "$NGINX_REJECT_CONF"
         rc=1
     }
+    render_nginx_real_ip | cmp -s - "$NGINX_REAL_IP_CONF" || {
+        template_differs "$(L "конфигурация real_ip" "real_ip configuration")" "$NGINX_REAL_IP_CONF"
+        rc=1
+    }
+    [[ -n "$(nginx_foreign_real_ip)" ]] && {
+        mismatch "$(L "real_ip_header задан в других конфигах nginx: $(nginx_foreign_real_ip | tr '\n' ' ')" "real_ip_header is set in other nginx configs: $(nginx_foreign_real_ip | tr '\n' ' ')")"
+        rc=1
+    }
     [[ -n "$(nginx_stale_rejects)" ]] && {
         mismatch "$(L "устаревший антискан на ${REALITY_TARGET}: $(nginx_stale_rejects | tr '\n' ' ')" "outdated anti-scan on ${REALITY_TARGET}: $(nginx_stale_rejects | tr '\n' ' ')")"
         rc=1
@@ -3126,7 +3187,7 @@ check_nginx() {
         rc=1
     }
     dest_ready "$(conf_get DOMAIN)" || {
-        mismatch "$(L "${REALITY_TARGET} не годится в target Reality (нужны TLS 1.3, h2, свой сертификат, отказ без SNI)" "${REALITY_TARGET} is not suitable as the Reality target (TLS 1.3, h2, own certificate and rejection without SNI are required)")"
+        mismatch "$(L "${REALITY_TARGET} не годится в target Reality (нужны PROXY protocol, TLS 1.3, h2, свой сертификат, отказ без SNI)" "${REALITY_TARGET} is not suitable as the Reality target (PROXY protocol, TLS 1.3, h2, own certificate and rejection without SNI are required)")"
         rc=1
     }
     return "$rc"
@@ -3145,7 +3206,30 @@ apply_nginx() {
         log_lines "  " <<< "$foreign"
         return 1
     fi
-    nginx_write_config
+    foreign=$(nginx_foreign_real_ip)
+    if [[ -n "$foreign" ]]; then
+        log "$(L "Директива real_ip_header уже задана в других конфигах nginx:" "The real_ip_header directive is already set in other nginx configs:")"
+        log_lines "  " <<< "$foreign"
+        return 1
+    fi
+    nginx_write_config || return 1
+    sync_reality_xver
+}
+
+sync_reality_xver() {
+    local report
+    [[ -s "$XUI_DB" ]] || return 0
+    report=$(py reality-xver plan "$XUI_DB" "$REALITY_TARGET") || return 0
+    [[ -n "$(json_lines "$report" changes)" ]] || return 0
+    xui_stop
+    backup_db_once
+    if ! report=$(py reality-xver set "$XUI_DB" "$REALITY_TARGET"); then
+        log "$(L "Не удалось изменить xver у Reality: ${report}" "Failed to change the Reality xver: ${report}")"
+        xui_start
+        return 1
+    fi
+    json_lines "$report" changes | log_lines ""
+    xui_start
 }
 
 release_public_443() {
@@ -3201,7 +3285,8 @@ check_panel() {
         mismatch "$(L "панель не слушает ${NGINX_ADDR}:${PANEL_PORT}" "the panel does not listen on ${NGINX_ADDR}:${PANEL_PORT}")"
         rc=1
     }
-    code=$(http_code "https://$(conf_get DOMAIN):${NGINX_PORT}$(conf_get PANEL_PATH)/" "$(conf_get DOMAIN):${NGINX_PORT}:${NGINX_ADDR}")
+    code=$(http_code "https://$(conf_get DOMAIN):${NGINX_PORT}$(conf_get PANEL_PATH)/" "$(conf_get DOMAIN):${NGINX_PORT}:${NGINX_ADDR}" \
+        --haproxy-protocol)
     [[ "$code" =~ ^(200|301|302|307|308)$ ]] || {
         mismatch "$(L "панель через nginx отвечает кодом ${code}" "the panel responds through nginx with code ${code}")"
         rc=1
@@ -3471,6 +3556,7 @@ check_hosts() {
         mismatch "$line"
         rc=1
     done < <(json_lines "$report" problems)
+    [[ "$CHECK_ONLY" -eq 1 ]] && return "$rc"
     report=$(inbounds_report plan)
     if [[ -n "$(json_lines "$report" problems)" ]]; then
         mismatch "$(L "инбаунды изменились после записи Хостов" "inbounds changed after writing Hosts")"
@@ -3694,6 +3780,18 @@ final_config_checks() {
     else
         report_fail "$(L "config.json: Reality порт $(json_get "$summary" reality.port), target $(json_get "$summary" reality.target)" "config.json: Reality port $(json_get "$summary" reality.port), target $(json_get "$summary" reality.target)")"
     fi
+    if [[ "$(json_get "$summary" reality.xver)" == 1 ]]; then
+        report_ok "$(L "config.json: Reality xver 1, nginx получает адрес клиента" "config.json: Reality xver 1, nginx receives the client address")"
+    else
+        report_fail "$(L "config.json: Reality xver $(json_get "$summary" reality.xver), нужен 1" "config.json: Reality xver $(json_get "$summary" reality.xver), expected 1")"
+    fi
+    if xhttp_enabled; then
+        if [[ "$(json_get "$summary" xhttp.real_ip)" == true ]]; then
+            report_ok "$(L "config.json: XHTTP берёт адрес клиента из X-Forwarded-For (trustedXForwardedFor: X-Real-IP)" "config.json: XHTTP takes the client address from X-Forwarded-For (trustedXForwardedFor: X-Real-IP)")"
+        else
+            report_fail "$(L "config.json: у XHTTP нет X-Real-IP в sockopt.trustedXForwardedFor или включён acceptProxyProtocol" "config.json: XHTTP has no X-Real-IP in sockopt.trustedXForwardedFor or acceptProxyProtocol is on")"
+        fi
+    fi
     if [[ "$(json_get "$summary" reality.limit_fallback)" == "[]" ]]; then
         report_ok "$(L "config.json: ненулевых limitFallback нет" "config.json: no non-zero limitFallback")"
     else
@@ -3733,7 +3831,7 @@ final_config_checks() {
 final_tls_checks() {
     local domain="$1" ip="$2" code body
     if dest_ready "$domain"; then
-        report_ok "$(L "${REALITY_TARGET}: TLS 1.3 + h2, свой сертификат, без SNI — отказ" "${REALITY_TARGET}: TLS 1.3 + h2, own certificate, rejection without SNI")"
+        report_ok "$(L "${REALITY_TARGET}: PROXY protocol, TLS 1.3 + h2, свой сертификат, без SNI — отказ" "${REALITY_TARGET}: PROXY protocol, TLS 1.3 + h2, own certificate, rejection without SNI")"
     else
         report_fail "$(L "${REALITY_TARGET} не годится в target Reality" "${REALITY_TARGET} is not suitable as the Reality target")"
     fi

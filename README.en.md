@@ -69,11 +69,11 @@ Only 80/tcp, 443/tcp, 443/udp and SSH are open from the outside.
 | Component | Settings |
 |---|---|
 | Certificate | Let's Encrypt via acme.sh, ECDSA, HTTP-01 challenge through nginx (webroot `/var/www/acme`). Renewed by `/usr/local/sbin/cert-renew.sh`: cron runs it daily, and the certificate is renewed when less than 30 days are left. |
-| nginx | Listens on `127.0.0.1:7443`, TLS 1.3 and h2. Connections without SNI or with a foreign SNI are rejected (`ssl_reject_handshake`). XHTTP (`grpc_pass`), the subscription and the panel (`proxy_pass`, WebSocket) live on secret paths, everything else is the decoy site. On 80/tcp the domain is redirected to https, other requests get 444. |
+| nginx | Listens on `127.0.0.1:7443`, TLS 1.3 and h2. The client address comes from Xray over PROXY protocol (`real_ip_header proxy_protocol`). Connections without SNI or with a foreign SNI are rejected (`ssl_reject_handshake`). XHTTP (`grpc_pass`), the subscription and the panel (`proxy_pass`, WebSocket) live on secret paths, everything else is the decoy site. On 80/tcp the domain is redirected to https, other requests get 444. |
 | 3x-ui | The panel listens on `127.0.0.1:2053` and is reachable only through nginx. The version tested with the script is installed; a newer one can be chosen in the extended installation. Files of the tested version are verified against SHA-256 sums built into the script. |
 | 3x-ui ads | Always off: nginx returns an empty list for `/<panel path>/sponsors` and 404 for `/<panel path>/sponsors/`. |
-| VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI is the domain, xver 0. |
-| VLESS XHTTP | Optional. `127.0.0.1`, `stream-one` mode. In the subscription: `<domain>:443`, TLS, ALPN `h2`, fingerprint `firefox`. Default port 8081. |
+| VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI is the domain, xver 1. |
+| VLESS XHTTP | Optional. `127.0.0.1`, `stream-one` mode, `trustedXForwardedFor`: `X-Real-IP`. In the subscription: `<domain>:443`, TLS, ALPN `h2`, fingerprint `firefox`. Default port 8081. |
 | Hysteria2 | Optional. 443/udp, domain certificate, ALPN `h3`, no obfuscation, masquerade `proxy` to `https://<domain>:443`, `rejectUnknownSni`. The site and the subscription send the `Alt-Svc: h3=":443"` header, which announces HTTP/3 on 443/udp. |
 | Sniffing | On Reality, XHTTP and Hysteria2: `http`, `tls`, `quic`, `routeOnly`. The domain found in traffic is used for routing only, the destination address is not replaced. |
 | Routing | Private and Russian IP addresses (`geoip:private`, `ext:geoip_RU.dat:ru`), BitTorrent, domains from `ext:geosite_RU.dat:ru-available-only-inside`, the `.ru`, `.su`, `.рф` zones, ads (`category-ads-all`) and UDP/443 on Reality and XHTTP are blocked. Existing rules are kept, missing ones are added. |
@@ -82,7 +82,7 @@ Only 80/tcp, 443/tcp, 443/udp and SSH are open from the outside.
 
 Custom directives for the panel go into `/etc/nginx/snippets/xui-panel*.conf`. These files are included in the config and stay untouched on re-runs.
 
-A custom decoy site is `index.html` and `favicon.ico`, `.svg` or `.png` in `/var/www/<domain>/`. Without them, a 403 page is served.
+A custom decoy site is `index.html` and `favicon.ico`, `.svg` or `.png` in `/var/www/<domain>/`. Without them, a 403 page is served. Unknown paths answer 404.
 
 ## Removal
 
@@ -95,7 +95,7 @@ sudo bash install.sh --uninstall
 | Item | What is removed |
 |---|---|
 | 1 | 3x-ui: the x-ui service, `/usr/local/x-ui`, `/etc/x-ui`, `/var/log/x-ui`, fail2ban jail `3x-ipl`. The database is copied to `/root/x-ui.db.<date>` first. |
-| 2 | nginx configs created by the script: site, anti-scan, port 80. |
+| 2 | nginx configs created by the script: site, anti-scan, real_ip, port 80. |
 | 3 | Certificate `/etc/ssl/<folder>`, the domain in acme.sh, `cert-renew.sh` and the cron job. acme.sh itself is removed only if it holds no other domains. |
 | 4 | ufw rules added by the script. The SSH rule stays. |
 | 5 | Everything above, plus the decoy site, answers file, log and `/root/nginx-*.tgz` archives. |
@@ -149,9 +149,9 @@ A database from a newer 3x-ui version than the installed one is not moved: the s
 At the end of installation and with `--check`, the script verifies that:
 
 - Only Xray listens on 443/tcp, nginx on `127.0.0.1:7443` and 80/tcp, Hysteria2 on 443/udp.
-- In `config.json` Reality is on 443 with target `127.0.0.1:7443`, has no non-zero `limitFallback`, Hysteria2 has no obfuscation, inbounds have sniffing, and the blocking and UDP/443 rules are in place.
+- In `config.json` Reality is on 443 with target `127.0.0.1:7443` and xver 1, has no non-zero `limitFallback`, Hysteria2 has no obfuscation, inbounds have sniffing, and the blocking and UDP/443 rules are in place.
 - There are no connections to `127.0.0.1:443`.
-- `127.0.0.1:7443` answers with TLS 1.3 and h2 using the domain certificate and rejects connections without SNI.
+- `127.0.0.1:7443` accepts PROXY protocol, answers with TLS 1.3 and h2 using the domain certificate and rejects connections without SNI.
 - Public 443 rejects connections without SNI or with a foreign SNI and serves the certificate for the domain.
 - The site, panel and subscription open through 443, and the subscription contains all protocols.
 - nginx intercepts the 3x-ui ad request.
@@ -176,6 +176,7 @@ Each step compares the current state with the desired one and fixes only the dif
 | `/root/xui-reality-selfsteal-443-installer.log` | log (0600) |
 | `/etc/nginx/sites-available/<domain>` | site |
 | `/etc/nginx/conf.d/00-reject-unknown-sni.conf` | anti-scan for 127.0.0.1:7443 |
+| `/etc/nginx/conf.d/30-real-ip.conf` | client address from PROXY protocol |
 | `/etc/nginx/conf.d/00-http-reject.conf` | anti-scan for 80/tcp |
 | `/etc/nginx/conf.d/10-http-<domain>.conf` | port 80 for the domain |
 | `/var/www/acme/` | HTTP-01 challenge directory |
