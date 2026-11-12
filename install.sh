@@ -58,7 +58,7 @@ NAME_RE='^[A-Za-z0-9_-]+$'
 USERNAME_RE='^[A-Za-z0-9_.-]{3,32}$'
 
 CONF_KEYS=(LANGUAGE INSTALL_MODE DOMAIN CERT_FOLDER ACME_EMAIL XHTTP XHTTP_PORT XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH
-    XUI_CREDENTIALS_PENDING XUI_VERIFY_PENDING HY2 CLIENT_NAME)
+    XUI_CREDENTIALS_PENDING XUI_VERIFY_PENDING HY2 WARP CLIENT_NAME)
 declare -A CONF=()
 
 RECONFIGURE=0
@@ -228,7 +228,7 @@ print_usage() {
         cat << EOF
 Usage: sudo bash ${0##*/} [--reconfigure | --check | --uninstall]
 
-  --reconfigure  answer the questions again (language, domain, email, XHTTP, paths, panel login, Hysteria2)
+  --reconfigure  answer the questions again (language, domain, email, XHTTP, paths, panel login, Hysteria2, WARP)
   --check        check only, no changes; exit code 0 — no errors, 1 — errors found,
                  2 — the check cannot be performed
   --uninstall    remove components of choice: 3x-ui, nginx, certificate, ufw rules, everything
@@ -238,7 +238,7 @@ EOF
     cat << EOF
 Использование: sudo bash ${0##*/} [--reconfigure | --check | --uninstall]
 
-  --reconfigure  задать вопросы заново (язык, домен, email, XHTTP, пути, логин панели, Hysteria2)
+  --reconfigure  задать вопросы заново (язык, домен, email, XHTTP, пути, логин панели, Hysteria2, WARP)
   --check        только проверка, без изменений; код выхода 0 — ошибок нет, 1 — есть ошибки,
                  2 — проверку выполнить невозможно
   --uninstall    удаление компонентов на выбор: 3x-ui, nginx, сертификат, правила ufw, всё
@@ -436,6 +436,9 @@ import uuid
 REALITY_PORT = 443
 REALITY_XVER = 1
 XHTTP_TRUSTED_HEADER = "X-Real-IP"
+WARP_TAG = "warp"
+WARP_MTU = 1280
+WARP_STRATEGY = "ForceIPv4"
 XHTTP_LISTEN = "127.0.0.1"
 HY2_IDLE_TIMEOUT = 300
 FINGERPRINT = "firefox"
@@ -587,15 +590,15 @@ def own_address(address, domain):
         return False
 
 
-def x25519(xray_bin):
-    proc = subprocess.run([xray_bin, "x25519"], capture_output=True, text=True, timeout=15)
+def x25519(xray_bin, command="x25519"):
+    proc = subprocess.run([xray_bin, command], capture_output=True, text=True, timeout=15)
     if proc.returncode != 0:
-        raise Failure(L(f"xray x25519: код {proc.returncode}: {proc.stderr.strip()}",
-                          f"xray x25519: code {proc.returncode}: {proc.stderr.strip()}"))
+        raise Failure(L(f"xray {command}: код {proc.returncode}: {proc.stderr.strip()}",
+                          f"xray {command}: code {proc.returncode}: {proc.stderr.strip()}"))
     private = re.search(r"^PrivateKey:\s*(\S+)", proc.stdout, re.M)
     public = re.search(r"^Password.*?:\s*(\S+)", proc.stdout, re.M)
     if not private or not public:
-        raise Failure(L("не удалось разобрать вывод xray x25519", "failed to parse xray x25519 output"))
+        raise Failure(L(f"не удалось разобрать вывод xray {command}", f"failed to parse xray {command} output"))
     return private.group(1), public.group(1)
 
 
@@ -1213,7 +1216,7 @@ class Api:
         self.token = token
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-    def call(self, path, body=None, form=None):
+    def call(self, path, body=None, form=None, timeout=20):
         headers = {"Authorization": f"Bearer {self.token}"}
         data, method = None, "GET"
         if body is not None:
@@ -1224,7 +1227,7 @@ class Api:
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         request = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
         try:
-            with self.opener.open(request, timeout=20) as response:
+            with self.opener.open(request, timeout=timeout) as response:
                 parsed = json.loads(response.read().decode())
         except urllib.error.HTTPError as e:
             raise Failure(f"{path}: HTTP {e.code}: {e.read().decode(errors='replace')[:300]}")
@@ -1399,6 +1402,78 @@ def is_udp443_block(rule):
             and str(rule.get("port")) == "443")
 
 
+def is_warp_rule(rule):
+    return (rule.get("outboundTag") == WARP_TAG and isinstance(rule.get("inboundTag"), list)
+            and rule.get("enabled", True) is not False
+            and not any(rule.get(key) for key in RULE_MATCH_KEYS if key != "inboundTag"))
+
+
+def warp_summary(outbounds, rules, tags):
+    found = [sorted(set(r["inboundTag"])) for r in rules if is_warp_rule(r)]
+    last = bool(rules) and is_warp_rule(rules[-1])
+    outbound = any(isinstance(o, dict) and o.get("tag") == WARP_TAG for o in outbounds)
+    return {"outbound": outbound, "rules": found, "expected": tags, "last": last,
+            "ok": outbound and found == [tags] and last}
+
+
+def warp_outbound(api, xray_bin):
+    data = api.call("panel/api/xray/warp/data", form={})
+    if data:
+        data = json.loads(data)
+        config = json.loads(api.call("panel/api/xray/warp/config", form={}))
+    else:
+        private, public = x25519(xray_bin, "wg")
+        registered = json.loads(api.call("panel/api/xray/warp/reg", form={"privateKey": private, "publicKey": public}))
+        data, config = registered.get("data") or {}, registered.get("config") or {}
+    cfg = config.get("config") if isinstance(config.get("config"), dict) else {}
+    peers = cfg.get("peers") or []
+    addresses = (cfg.get("interface") or {}).get("addresses") or {}
+    address = [f"{addresses[key]}/{bits}" for key, bits in (("v4", 32), ("v6", 128)) if addresses.get(key)]
+    if not peers or not address or not data.get("private_key"):
+        raise Failure(L("Cloudflare не вернул настройки WARP", "Cloudflare did not return the WARP settings"))
+    return {
+        "tag": WARP_TAG, "protocol": "wireguard",
+        "settings": {
+            "mtu": WARP_MTU, "secretKey": data["private_key"], "address": address,
+            "reserved": list(base64.b64decode(cfg.get("client_id") or data.get("client_id") or "")),
+            "peers": [{"publicKey": peers[0].get("public_key"), "allowedIPs": ["0.0.0.0/0", "::/0"],
+                       "endpoint": (peers[0].get("endpoint") or {}).get("host")}],
+            "noKernelTun": True,
+        },
+        "streamSettings": {"sockopt": {"domainStrategy": WARP_STRATEGY}},
+        "targetStrategy": WARP_STRATEGY,
+    }
+
+
+def apply_warp(api, template, tags, xray_bin):
+    changes = []
+    outbounds = template.setdefault("outbounds", [])
+    rules = template["routing"]["rules"]
+    outbound = next((o for o in outbounds if isinstance(o, dict) and o.get("tag") == WARP_TAG), None)
+    ours = [r for r in rules if is_warp_rule(r)]
+    if outbound is None or not ours:
+        created = outbound is None
+        if created:
+            outbound = warp_outbound(api, xray_bin)
+        try:
+            result = api.call("panel/api/xray/testOutbound", timeout=90, form={
+                "outbound": json.dumps(outbound), "allOutbounds": json.dumps(outbounds + ([outbound] if created else []))}) or {}
+        except Failure as e:
+            result = {"error": str(e)}
+        if not result.get("success"):
+            raise Failure(L(f"исходящий {WARP_TAG} не отвечает ({result.get('error') or 'нет ответа'}), маршрутизация не изменена",
+                              f"the {WARP_TAG} outbound does not respond ({result.get('error') or 'no response'}), routing is not changed"))
+        if created:
+            outbounds.append(outbound)
+            changes.append(L(f"добавлен исходящий {WARP_TAG} (Cloudflare WARP), задержка {result.get('delay')} мс",
+                             f"added the {WARP_TAG} outbound (Cloudflare WARP), delay {result.get('delay')} ms"))
+    if len(ours) != 1 or sorted(set(ours[0]["inboundTag"])) != tags or rules[-1] is not ours[0]:
+        rules[:] = [r for r in rules if not is_warp_rule(r)]
+        rules.append({"type": "field", "inboundTag": tags, "outboundTag": WARP_TAG})
+        changes.append(f"{tags} → {WARP_TAG}")
+    return changes
+
+
 def block_missing(rules):
     have = {field: {str(v) for r in rules if plain_block(r, field) for v in r[field]}
             for field in ("ip", "protocol", "domain")}
@@ -1447,6 +1522,7 @@ def cmd_config_summary(path):
     result["udp443_expected"] = expected
     result["udp443_actual"] = actual
     result["udp443_ok"] = len(actual) == 1 and actual[0] == expected
+    result["warp"] = warp_summary(config.get("outbounds") or [], rules, sorted({result[k]["tag"] for k in KINDS if result[k]}))
     emit(result)
 
 
@@ -1493,9 +1569,10 @@ def xray_test(config_path, xray_bin, rules):
         raise Failure("xray -test: " + (lines[-1] if lines else L(f"код {proc.returncode}", f"code {proc.returncode}")))
 
 
-def cmd_routing_apply(base, token, reality_tag, xhttp_tag, config_path, xray_bin):
+def cmd_routing_apply(base, token, reality_tag, xhttp_tag, config_path, xray_bin, hy2_tag="", warp=""):
     api = Api(base, token)
-    template = json.loads(api.call("panel/api/xray/", form={}))["xraySetting"]
+    loaded = json.loads(api.call("panel/api/xray/", form={}))
+    template = loaded["xraySetting"]
     rules = template.setdefault("routing", {}).setdefault("rules", [])
     changes = []
     missing = block_missing(rules)
@@ -1509,19 +1586,27 @@ def cmd_routing_apply(base, token, reality_tag, xhttp_tag, config_path, xray_bin
         rules[:] = [r for r in rules if not is_udp443_block(r)]
         rules.append({"type": "field", "network": "udp", "port": "443", "inboundTag": tags, "outboundTag": "blocked"})
         changes.append(L(f"UDP/443 → blocked для {tags}", f"UDP/443 → blocked for {tags}"))
+    if warp == "yes":
+        changes += apply_warp(api, template, sorted({tag for tag in (reality_tag, xhttp_tag, hy2_tag) if tag}), xray_bin)
     if changes:
-        api.call("panel/api/xray/update", form={"xraySetting": json.dumps(template)})
+        form = {"xraySetting": json.dumps(template)}
+        if loaded.get("outboundTestUrl"):
+            form["outboundTestUrl"] = loaded["outboundTestUrl"]
+        api.call("panel/api/xray/update", form=form)
     emit({"changes": changes})
 
 
-def cmd_routing_test(base, token, reality_tag, xhttp_tag):
+def cmd_routing_test(base, token, reality_tag, xhttp_tag, hy2_tag="", warp=""):
     api = Api(base, token)
 
-    def blocked(tag, network="tcp", **target):
+    def routed(tag, network="tcp", **target):
         form = {"inboundTag": tag, "port": "443", "network": network}
         form.update(target)
         obj = api.call("panel/api/xray/routeTest", form=form)
-        return bool(obj and obj.get("matched") and obj.get("outboundTag") == "blocked")
+        return obj.get("outboundTag") if obj and obj.get("matched") else ""
+
+    def blocked(tag, network="tcp", **target):
+        return routed(tag, network, **target) == "blocked"
 
     probe = "probe-" + "".join(c for c in reality_tag + xhttp_tag if c.isalnum())
     checks = {
@@ -1536,6 +1621,10 @@ def cmd_routing_test(base, token, reality_tag, xhttp_tag):
     }
     if xhttp_tag:
         checks[L("XHTTP UDP/443 блокируется", "XHTTP UDP/443 is blocked")] = blocked(xhttp_tag, "udp", ip="8.8.8.8")
+    if warp == "yes":
+        for tag in sorted({tag for tag in (reality_tag, xhttp_tag, hy2_tag) if tag}):
+            checks[L(f"{tag}: example.com выходит через {WARP_TAG}", f"{tag}: example.com exits through {WARP_TAG}")] = \
+                routed(tag, domain="example.com") == WARP_TAG
     failed = [name for name, ok in checks.items() if not ok]
     emit({"failed": failed})
     if failed:
@@ -1927,6 +2016,10 @@ xhttp_path_answer() {
     conf_get XHTTP_PATH
 }
 
+warp_enabled() {
+    [[ "$(conf_get WARP)" == yes ]]
+}
+
 hy2_port_answer() {
     if [[ "$(conf_get HY2)" == yes ]]; then
         printf '%s' "$HY2_PORT"
@@ -2252,6 +2345,24 @@ resolve_hy2() {
         conf_set HY2 yes
     else
         conf_set HY2 no
+    fi
+}
+
+resolve_warp() {
+    local previous
+    previous=$(conf_get WARP)
+    [[ -n "$previous" && "$RECONFIGURE" -eq 0 ]] && return 0
+    if recommended || { [[ "$RECONFIGURE" -eq 0 ]] && xui_has_config; }; then
+        conf_set WARP no
+        return 0
+    fi
+    if ask_yes_no "$(L "Добавить выход в интернет через Cloudflare WARP?" "Add an exit to the internet through Cloudflare WARP?")" n; then
+        conf_set WARP yes
+        return 0
+    fi
+    conf_set WARP no
+    if [[ "$previous" == yes ]]; then
+        printf '%s\n' "$(L "  Исходящий warp и правило маршрутизации остаются, они удаляются в панели 3x-ui." "  The warp outbound and the routing rule stay, they are removed in the 3x-ui panel.")"
     fi
 }
 
@@ -3621,7 +3732,26 @@ check_routing() {
         mismatch "$(L "правило UDP/443 → blocked: $(json_get "$summary" udp443_actual), нужно $(json_get "$summary" udp443_expected)" "UDP/443 → blocked rule: $(json_get "$summary" udp443_actual), expected $(json_get "$summary" udp443_expected)")"
         rc=1
     }
+    if warp_enabled && [[ "$(json_get "$summary" warp.ok)" != true ]]; then
+        warp_problems "$summary" | mismatch_lines
+        rc=1
+    fi
     return "$rc"
+}
+
+warp_problems() {
+    local rules expected
+    rules=$(json_get "$1" warp.rules)
+    expected=$(json_get "$1" warp.expected)
+    [[ "$rules" == "[]" ]] || rules="${rules:1:-1}"
+    if [[ "$(json_get "$1" warp.outbound)" != true ]]; then
+        printf '%s\n' "$(L "нет исходящего warp" "no warp outbound")"
+    fi
+    if [[ "$rules" != "$expected" ]]; then
+        printf '%s\n' "$(L "правило → warp: ${rules}, нужно ${expected}" "→ warp rule: ${rules}, expected ${expected}")"
+    elif [[ "$(json_get "$1" warp.last)" != true ]]; then
+        printf '%s\n' "$(L "правило → warp стоит не последним" "the → warp rule is not the last one")"
+    fi
 }
 
 block_missing_text() {
@@ -3629,19 +3759,21 @@ block_missing_text() {
 }
 
 apply_routing() {
-    local summary token report reality xhttp
+    local summary token report reality xhttp hy2
     summary=$(py config-summary "$XRAY_CONFIG") || return 1
     reality=$(json_get "$summary" reality.tag)
     xhttp=$(json_get "$summary" xhttp.tag)
+    hy2=$(json_get "$summary" hy2.tag)
     token=$(api_token) || return 1
-    report=$(py routing-apply "$(api_base)" "$token" "$reality" "$xhttp" "$XRAY_CONFIG" "$(xray_bin)") || {
+    warp_enabled && log "$(L "Cloudflare WARP: проверка исходящего warp" "Cloudflare WARP: testing the warp outbound")"
+    report=$(py routing-apply "$(api_base)" "$token" "$reality" "$xhttp" "$XRAY_CONFIG" "$(xray_bin)" "$hy2" "$(conf_get WARP)") || {
         log "$(L "Не удалось изменить маршрутизацию: ${report}" "Failed to change routing: ${report}")"
         return 1
     }
     json_lines "$report" changes | while IFS= read -r line; do log_quiet "  ${line}"; done
     xui_restart || return 1
     token=$(api_token) || return 1
-    report=$(py routing-test "$(api_base)" "$token" "$reality" "$xhttp") || {
+    report=$(py routing-test "$(api_base)" "$token" "$reality" "$xhttp" "$hy2" "$(conf_get WARP)") || {
         log "$(L "Проверка routeTest не пройдена: $(json_get "$report" failed)" "routeTest check failed: $(json_get "$report" failed)")"
         return 1
     }
@@ -3773,7 +3905,7 @@ final_listen_checks() {
 }
 
 final_config_checks() {
-    local summary loops
+    local summary loops line
     summary=$(py config-summary "$XRAY_CONFIG") || {
         report_fail "$(L "не удалось прочитать ${XRAY_CONFIG}" "failed to read ${XRAY_CONFIG}")"
         return
@@ -3822,6 +3954,15 @@ final_config_checks() {
         report_ok "$(L "правило UDP/443 → blocked: $(json_get "$summary" udp443_expected)" "UDP/443 → blocked rule: $(json_get "$summary" udp443_expected)")"
     else
         report_fail "$(L "правило UDP/443 → blocked: $(json_get "$summary" udp443_actual), нужно $(json_get "$summary" udp443_expected)" "UDP/443 → blocked rule: $(json_get "$summary" udp443_actual), expected $(json_get "$summary" udp443_expected)")"
+    fi
+    if warp_enabled; then
+        if [[ "$(json_get "$summary" warp.ok)" == true ]]; then
+            report_ok "$(L "правило → warp (Cloudflare WARP): $(json_get "$summary" warp.expected)" "→ warp rule (Cloudflare WARP): $(json_get "$summary" warp.expected)")"
+        else
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && report_fail "$line"
+            done < <(warp_problems "$summary")
+        fi
     fi
     loops=$(ss -Htn 2> /dev/null | grep -c "127.0.0.1:${PUBLIC_TLS_PORT} ")
     if [[ "$loops" -eq 0 ]]; then
@@ -4121,7 +4262,7 @@ uninstall_xui() {
         systemctl restart fail2ban > /dev/null 2>&1
     fi
     conf_unset XHTTP XHTTP_PORT XHTTP_PATH SUB_PATH PANEL_PATH XUI_USERNAME XUI_PASSWORD XUI_PASSWORD_HASH \
-        XUI_CREDENTIALS_PENDING XUI_VERIFY_PENDING HY2 CLIENT_NAME
+        XUI_CREDENTIALS_PENDING XUI_VERIFY_PENDING HY2 WARP CLIENT_NAME
 }
 
 uninstall_nginx() {
@@ -4396,7 +4537,7 @@ check_resolve_answers() {
             CONF[HY2]=no
         fi
     fi
-    log "$(L "Домен: $(conf_get DOMAIN), сертификат: $(cert_dir), XHTTP: $(xhttp_enabled && echo да || echo нет), Hysteria2: $([[ "$(hy2_port_answer)" != 0 ]] && echo "UDP/$(hy2_port_answer)" || echo нет)" "Domain: $(conf_get DOMAIN), certificate: $(cert_dir), XHTTP: $(xhttp_enabled && echo yes || echo no), Hysteria2: $([[ "$(hy2_port_answer)" != 0 ]] && echo "UDP/$(hy2_port_answer)" || echo no)")"
+    log "$(L "Домен: $(conf_get DOMAIN), сертификат: $(cert_dir), XHTTP: $(xhttp_enabled && echo да || echo нет), Hysteria2: $([[ "$(hy2_port_answer)" != 0 ]] && echo "UDP/$(hy2_port_answer)" || echo нет), WARP: $(warp_enabled && echo да || echo нет)" "Domain: $(conf_get DOMAIN), certificate: $(cert_dir), XHTTP: $(xhttp_enabled && echo yes || echo no), Hysteria2: $([[ "$(hy2_port_answer)" != 0 ]] && echo "UDP/$(hy2_port_answer)" || echo no), WARP: $(warp_enabled && echo yes || echo no)")"
 }
 
 check_step() {
@@ -4477,6 +4618,7 @@ main() {
     resolve_xhttp
     resolve_xhttp_port
     resolve_hy2
+    resolve_warp
     resolve_paths
     resolve_credentials
     converge "nginx" nginx

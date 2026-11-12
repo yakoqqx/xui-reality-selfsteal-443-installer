@@ -29,7 +29,7 @@ sudo bash install.sh
 The first run asks for the language (Russian or English) and the type of installation:
 
 - **Standard** — VLESS Reality on 443 only. The domain and email are needed, everything else is filled in automatically.
-- **Extended** — XHTTP and Hysteria2 on top, custom paths, panel username and password, moving an `x-ui.db` database.
+- **Extended** — XHTTP and Hysteria2 on top, exit through Cloudflare WARP, custom paths, panel username and password, moving an `x-ui.db` database.
 
 Answer the questions again:
 
@@ -75,6 +75,7 @@ Only 80/tcp, 443/tcp, 443/udp and SSH are open from the outside.
 | VLESS Reality | 443/tcp, `xtls-rprx-vision`, fingerprint `firefox`, target `127.0.0.1:7443`, SNI is the domain, xver 1. |
 | VLESS XHTTP | Optional. `127.0.0.1`, `stream-one` mode, `trustedXForwardedFor`: `X-Real-IP`. In the subscription: `<domain>:443`, TLS, SNI is the domain, ALPN `h2`, fingerprint `firefox`. Default port 8081. |
 | Hysteria2 | Optional. 443/udp, domain certificate, ALPN `h3`, no obfuscation, masquerade `proxy` to `https://<domain>:443`, `rejectUnknownSni`. The site and the subscription send the `Alt-Svc: h3=":443"` header, which announces HTTP/3 on 443/udp. |
+| Cloudflare WARP | Optional. The `warp` outbound (WireGuard, MTU 1280, `ForceIPv4`) and the last routing rule: Reality, XHTTP and Hysteria2 traffic exits through WARP, the exit address differs from the server address. The blocking rules stay above it. |
 | Sniffing | On Reality, XHTTP and Hysteria2: `http`, `tls`, `quic`, `routeOnly`. The domain found in traffic is used for routing only, the destination address is not replaced. |
 | Routing | Private and Russian IP addresses (`geoip:private`, `ext:geoip_RU.dat:ru`), BitTorrent, domains from `ext:geosite_RU.dat:ru-available-only-inside`, the `.ru`, `.su`, `.рф` zones, ads (`category-ads-all`) and UDP/443 on Reality and XHTTP are blocked. Existing rules are kept, missing ones are added. |
 | Subscription | `127.0.0.1:2096`, link format `https://<domain>/<subscription path>/`. Rows are named after Hosts: `VLESS-TCP`, `VLESS-XHTTP`, `HYSTERIA2`. The response gets the `socks-auth-mode: auto` and `http-auth-mode: auto` headers: Happ sets the username and password of its local proxies on its own. |
@@ -111,9 +112,10 @@ Questions in order:
 3. 3x-ui version, if a newer one than the tested version is out.
 4. VLESS XHTTP and its internal port.
 5. Hysteria2.
-6. Secret paths for XHTTP, the subscription and the panel.
-7. Panel username and password.
-8. First client's name.
+6. Exit to the internet through Cloudflare WARP.
+7. Secret paths for XHTTP, the subscription and the panel.
+8. Panel username and password.
+9. First client's name.
 
 Only the domain and email are required, everything else is generated if left empty.
 
@@ -158,6 +160,7 @@ At the end of installation and with `--check`, the script verifies that:
 - On 80/tcp, requests by IP or with a foreign Host are closed without a response, the domain gets a 301 to https, `/.well-known/acme-challenge/` is served.
 - acme.sh works through webroot, `cert-renew.sh` is in root's cron.
 - The Xray log has no warning about Reality not being on 443.
+- With the WARP exit, the `warp` outbound and the exit rule are in place.
 - ufw rules.
 
 If a path in the answers file differs from the 3x-ui database, `--check` shows a warning and checks against the database.
